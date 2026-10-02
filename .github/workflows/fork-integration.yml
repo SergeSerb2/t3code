@@ -1,0 +1,49 @@
+name: Fork Integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-integration-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  orchestrator:
+    if: github.repository == 'SergeSerb2/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+      - name: Typecheck server
+        run: vp run --filter t3 typecheck
+      - name: Verify orchestrator migration and recovery
+        run: >-
+          vp test run
+          apps/server/src/orchestration-v2/DelegatedCompletionDelivery.test.ts
+          apps/server/src/orchestration-v2/ThreadForkService.test.ts
+          apps/server/src/orchestration-v2/Orchestrator.migration.test.ts
+          apps/server/src/orchestration-v2/V1ImportBoundary.test.ts
+          apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
+          --maxWorkers=2
+      - name: Bundle server
+        run: vp run --filter t3 build:bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fork-server-${{ github.sha }}
+          path: apps/server/dist/
+          if-no-files-found: error

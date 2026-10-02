@@ -33,7 +33,7 @@
  * @module provider/Layers/ProviderInstanceRegistryLive
  */
 import {
-  defaultInstanceIdForDriver,
+  providerInstanceConfigEnabledFlag,
   ProviderInstanceId,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
@@ -52,14 +52,8 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { buildUnavailableProviderSnapshot } from "../unavailableProviderSnapshot.ts";
-import {
-  ProviderInstanceRegistry,
-  type ProviderInstanceRegistryShape,
-} from "../Services/ProviderInstanceRegistry.ts";
-import {
-  ProviderInstanceRegistryMutator,
-  type ProviderInstanceRegistryMutatorShape,
-} from "../Services/ProviderInstanceRegistryMutator.ts";
+import * as ProviderInstanceRegistry from "../Services/ProviderInstanceRegistry.ts";
+import * as ProviderInstanceRegistryMutator from "../Services/ProviderInstanceRegistryMutator.ts";
 import type { AnyProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
 
 /**
@@ -93,12 +87,20 @@ interface RegistryState {
 const entryEqual = (a: ProviderInstanceConfig, b: ProviderInstanceConfig): boolean =>
   Equal.equals(a, b);
 
-const decodedConfigEnabled = (config: unknown): boolean | undefined => {
-  if (!config || typeof config !== "object" || globalThis.Array.isArray(config)) {
-    return undefined;
+/**
+ * Resolve an entry's enabled state. An explicit false on either the
+ * envelope or the raw config blob wins (most restrictive) — old settings
+ * files can carry both flags with conflicting values, and a user's disable
+ * must never be silently undone. Otherwise the envelope flag wins, then the
+ * decoded config's flag (which carries the driver schema's default for
+ * built-ins and forks alike), then enabled by default.
+ */
+const resolveEntryEnabled = (entry: ProviderInstanceConfig, typedConfig: unknown): boolean => {
+  const rawConfigEnabled = providerInstanceConfigEnabledFlag(entry.config);
+  if (entry.enabled === false || rawConfigEnabled === false) {
+    return false;
   }
-  const enabled = (config as { readonly enabled?: unknown }).enabled;
-  return typeof enabled === "boolean" ? enabled : undefined;
+  return entry.enabled ?? providerInstanceConfigEnabledFlag(typedConfig) ?? true;
 };
 
 /**
@@ -171,7 +173,7 @@ const buildEntry = <R>(input: {
         displayName: entry.displayName,
         accentColor: entry.accentColor,
         environment: entry.environment ?? [],
-        enabled: entry.enabled ?? decodedConfigEnabled(typedConfig) ?? true,
+        enabled: resolveEntryEnabled(entry, typedConfig),
         config: typedConfig,
       })
       .pipe(Effect.provideService(Scope.Scope, childScope), Effect.result);
@@ -332,8 +334,8 @@ export const makeProviderInstanceRegistry = <R>(input: {
   readonly configMap: ProviderInstanceConfigMap;
 }): Effect.Effect<
   {
-    readonly registry: ProviderInstanceRegistryShape;
-    readonly mutator: ProviderInstanceRegistryMutatorShape;
+    readonly registry: ProviderInstanceRegistry.ProviderInstanceRegistryShape;
+    readonly mutator: ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutatorShape;
   },
   never,
   R | Scope.Scope
@@ -362,14 +364,14 @@ export const makeProviderInstanceRegistry = <R>(input: {
 
     const state: RegistryState = { entries, unavailable, changes };
     const reconcileWithR = makeReconcile({ state, driversById, parentScope });
-    const reconcile: ProviderInstanceRegistryMutatorShape["reconcile"] = (configMap) =>
-      reconcileWithR(configMap).pipe(Effect.provideContext(driverContext));
+    const reconcile: ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutatorShape["reconcile"] =
+      (configMap) => reconcileWithR(configMap).pipe(Effect.provideContext(driverContext));
 
     // Hydrate the initial configMap synchronously so callers can read
     // `listInstances` immediately after this effect completes.
     yield* reconcile(input.configMap);
 
-    const registry: ProviderInstanceRegistryShape = {
+    const registry: ProviderInstanceRegistry.ProviderInstanceRegistryShape = {
       getInstance: (id) => Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.instance)),
       listInstances: Ref.get(entries).pipe(
         Effect.map(
@@ -397,28 +399,12 @@ export const makeProviderInstanceRegistry = <R>(input: {
       },
     };
 
-    const mutator: ProviderInstanceRegistryMutatorShape = { reconcile };
+    const mutator: ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutatorShape = {
+      reconcile,
+    };
 
     return { registry, mutator };
   });
-
-/**
- * Assemble a `ProviderInstanceRegistry` Layer bound to a fixed set of
- * drivers and a pre-resolved `ProviderInstanceConfigMap`. Used by tests
- * that want explicit control over the registry's source-of-truth without
- * wiring up the settings watcher.
- *
- * Only exposes the public registry tag — hot-reload consumers should use
- * `ProviderInstanceRegistryMutableLayer` (below) or the hydration layer.
- */
-export const ProviderInstanceRegistryLayer = <R>(input: {
-  readonly drivers: ReadonlyArray<AnyProviderDriver<R>>;
-  readonly configMap: ProviderInstanceConfigMap;
-}): Layer.Layer<ProviderInstanceRegistry, never, R> =>
-  Layer.effect(
-    ProviderInstanceRegistry,
-    makeProviderInstanceRegistry(input).pipe(Effect.map((built) => built.registry)),
-  ) as Layer.Layer<ProviderInstanceRegistry, never, R>;
 
 /**
  * Layer variant that also exposes the mutator tag. Consumed by
@@ -429,15 +415,23 @@ export const ProviderInstanceRegistryLayer = <R>(input: {
 export const ProviderInstanceRegistryMutableLayer = <R>(input: {
   readonly drivers: ReadonlyArray<AnyProviderDriver<R>>;
   readonly configMap: ProviderInstanceConfigMap;
-}): Layer.Layer<ProviderInstanceRegistry | ProviderInstanceRegistryMutator, never, R> =>
+}): Layer.Layer<
+  | ProviderInstanceRegistry.ProviderInstanceRegistry
+  | ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator,
+  never,
+  R
+> =>
   Layer.effectContext(
     makeProviderInstanceRegistry(input).pipe(
       Effect.map(({ registry, mutator }) =>
-        Context.make(ProviderInstanceRegistry, registry).pipe(
-          Context.add(ProviderInstanceRegistryMutator, mutator),
+        Context.make(ProviderInstanceRegistry.ProviderInstanceRegistry, registry).pipe(
+          Context.add(ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator, mutator),
         ),
       ),
     ),
-  ) as Layer.Layer<ProviderInstanceRegistry | ProviderInstanceRegistryMutator, never, R>;
-
-export { defaultInstanceIdForDriver };
+  ) as Layer.Layer<
+    | ProviderInstanceRegistry.ProviderInstanceRegistry
+    | ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator,
+    never,
+    R
+  >;

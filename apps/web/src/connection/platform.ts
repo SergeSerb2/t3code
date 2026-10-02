@@ -1,11 +1,7 @@
 import {
-  ClientPresentation,
-  CloudSession,
-  EnvironmentOwnedDataCleanup,
+  ClientCapabilities,
   PlatformConnectionSource,
-  PrimaryEnvironmentAuth,
-  RelayDeviceIdentity,
-  SshEnvironmentGateway,
+  Persistence,
 } from "@t3tools/client-runtime/platform";
 import {
   BearerConnectionCredential,
@@ -42,6 +38,7 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
 
+import { APP_VERSION } from "../branding";
 import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import {
@@ -50,6 +47,7 @@ import {
 } from "../environments/primary/target";
 import { clearComposerDraftsEnvironment } from "../composerDraftStore";
 import { isHostedStaticApp } from "../hostedPairing";
+import { isLocalEnvironmentDisabled } from "../localEnvironment";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { acknowledgeRpcRequest, trackRpcRequestSent } from "../rpc/requestLatencyState";
 import {
@@ -58,6 +56,7 @@ import {
   type DesktopSecondaryBootstrapsRead,
 } from "./desktopLocal";
 import { connectionStorageLayer } from "./storage";
+import { clientPresentationMetadata } from "./clientMetadata";
 
 let nextObservedRpcRequestId = 0;
 
@@ -114,13 +113,16 @@ const wakeupsLayer = Wakeups.layer({
 });
 
 function clientMetadata() {
-  const desktop = window.desktopBridge !== undefined;
-  const platform = navigator.platform.trim();
-  return {
-    label: desktop ? "T3 Code Desktop" : "T3 Code Web",
-    deviceType: "desktop" as const,
-    ...(platform === "" ? {} : { os: platform }),
-  };
+  return clientPresentationMetadata({
+    appVersion: APP_VERSION,
+    hosted: isHostedStaticApp(),
+    identity: {
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      maxTouchPoints: navigator.maxTouchPoints,
+    },
+    desktopBridge: window.desktopBridge,
+  });
 }
 
 function sshPreparationError(cause: unknown) {
@@ -172,11 +174,14 @@ export const provisionDesktopSshEnvironment = Effect.fn(
 
 const capabilitiesLayer = Layer.effectContext(
   Effect.sync(() => {
-    const presentation = ClientPresentation.of({
+    const presentation = ClientCapabilities.ClientPresentation.of({
       metadata: clientMetadata(),
       scopes: AuthStandardClientScopes,
     });
-    const cloudSession = CloudSession.of({
+    const cloudSession = ClientCapabilities.CloudSession.of({
+      identity: Effect.sync(() =>
+        Option.fromNullishOr(appAtomRegistry.get(managedRelaySessionAtom)),
+      ),
       clerkToken: Effect.gen(function* () {
         const session = appAtomRegistry.get(managedRelaySessionAtom);
         if (session === null) {
@@ -203,10 +208,10 @@ const capabilitiesLayer = Layer.effectContext(
         return token;
       }),
     });
-    const identity = RelayDeviceIdentity.of({
-      deviceId: Effect.succeed(Option.none()),
+    const identity = ClientCapabilities.RelayDeviceIdentity.of({
+      deviceId: Effect.succeedNone,
     });
-    const primaryAuth = PrimaryEnvironmentAuth.of({
+    const primaryAuth = ClientCapabilities.PrimaryEnvironmentAuth.of({
       bearerToken: Effect.tryPromise({
         try: readDesktopPrimaryBearerToken,
         catch: (cause) =>
@@ -216,7 +221,7 @@ const capabilitiesLayer = Layer.effectContext(
           }),
       }).pipe(Effect.map(Option.fromNullishOr)),
     });
-    const ssh = SshEnvironmentGateway.of({
+    const ssh = ClientCapabilities.SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(function* (target) {
         const bridge = window.desktopBridge;
         if (bridge === undefined) {
@@ -274,11 +279,11 @@ const capabilitiesLayer = Layer.effectContext(
       }),
     });
 
-    return Context.make(CloudSession, cloudSession).pipe(
-      Context.add(PrimaryEnvironmentAuth, primaryAuth),
-      Context.add(RelayDeviceIdentity, identity),
-      Context.add(ClientPresentation, presentation),
-      Context.add(SshEnvironmentGateway, ssh),
+    return Context.make(ClientCapabilities.CloudSession, cloudSession).pipe(
+      Context.add(ClientCapabilities.PrimaryEnvironmentAuth, primaryAuth),
+      Context.add(ClientCapabilities.RelayDeviceIdentity, identity),
+      Context.add(ClientCapabilities.ClientPresentation, presentation),
+      Context.add(ClientCapabilities.SshEnvironmentGateway, ssh),
     );
   }),
 );
@@ -454,10 +459,10 @@ export function secondaryRegistrationsToRetainAfterTopologyRead(
 }
 
 const platformConnectionSourceLayer = Layer.effect(
-  PlatformConnectionSource,
+  PlatformConnectionSource.PlatformConnectionSource,
   Effect.gen(function* () {
-    if (isHostedStaticApp()) {
-      return PlatformConnectionSource.of({
+    if (isHostedStaticApp() || isLocalEnvironmentDisabled()) {
+      return PlatformConnectionSource.PlatformConnectionSource.of({
         registrations: Stream.empty,
       });
     }
@@ -565,7 +570,7 @@ const platformConnectionSourceLayer = Layer.effect(
       return registrations as ReadonlyArray<PlatformConnectionRegistration>;
     }).pipe(Effect.provide(FetchHttpClient.layer));
 
-    return PlatformConnectionSource.of({
+    return PlatformConnectionSource.PlatformConnectionSource.of({
       registrations: Stream.tick(PLATFORM_POLL_INTERVAL).pipe(
         Stream.mapEffect(() => buildPlatformRegistrations),
       ),
@@ -574,8 +579,8 @@ const platformConnectionSourceLayer = Layer.effect(
 );
 
 const environmentOwnedDataCleanupLayer = Layer.succeed(
-  EnvironmentOwnedDataCleanup,
-  EnvironmentOwnedDataCleanup.of({
+  Persistence.EnvironmentOwnedDataCleanup,
+  Persistence.EnvironmentOwnedDataCleanup.of({
     clear: (environmentId) =>
       Effect.sync(() => {
         clearComposerDraftsEnvironment(environmentId);

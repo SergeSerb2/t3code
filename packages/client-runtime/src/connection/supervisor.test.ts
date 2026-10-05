@@ -1988,14 +1988,35 @@ describe("EnvironmentSupervisor routes", () => {
     }),
   );
 
-  it.effect("learns the LAN address over T3 Connect and moves to it", () =>
+  it.effect("tries a healthy relay after a LAN session stalls during synchronization", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        checkRoute: () => Effect.succeed("answered"),
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
+        ready: (attempt) => (attempt === 1 ? Effect.never : Effect.void),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(LAN_THEN_RELAY_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* awaitState(supervisor.state, (state) => state.stage === "synchronizing");
+      yield* TestClock.adjust("15 seconds");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      expect(Option.getOrThrow(yield* SubscriptionRef.get(supervisor.prepared)).target._tag).toBe(
+        "RelayConnectionTarget",
+      );
+      expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+    }),
+  );
+
+  it.effect("learns the TLS LAN address over T3 Connect and moves to it", () =>
     Effect.gen(function* () {
       const relayEntry: ConnectionCatalogEntry = {
         target: RELAY_TARGET,
         profile: Option.none(),
         enabled: true,
       };
-      const lanAddress = yield* Ref.make("http://192.168.1.10:3773/");
+      const lanAddress = yield* Ref.make("https://192.168.1.10:3773/");
       const learned = yield* Ref.make<ReadonlyArray<string>>([]);
       const harness = yield* makeHarness({
         checkRoute: (route) =>
@@ -2022,7 +2043,6 @@ describe("EnvironmentSupervisor routes", () => {
               entry,
               activeRoute,
               reported,
-              allowInsecure: true,
             });
             if (routes === null) return Option.none();
             const next = entryWithRoutes(entry, routes);
@@ -2045,7 +2065,7 @@ describe("EnvironmentSupervisor routes", () => {
         "BearerConnectionTarget",
       );
       expect(yield* Ref.get(learned)).toEqual([
-        `learned:${TARGET.environmentId}:http://192.168.1.10:3773`,
+        `learned:${TARGET.environmentId}:https://192.168.1.10:3773`,
       ]);
     }),
   );

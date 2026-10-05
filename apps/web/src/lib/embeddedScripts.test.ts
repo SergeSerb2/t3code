@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { embeddedScripts } from "./embeddedScripts";
+import { MAX_SHELL_HIGHLIGHT_LENGTH } from "@t3tools/client-runtime/work-log/command-label";
+
+it("skips parsing oversized heredocs while preserving ordinary embedded scripts", () => {
+  expect(
+    embeddedScripts(`python3 <<'PY'\n${"print(1)\n".repeat(MAX_SHELL_HIGHLIGHT_LENGTH)}PY`),
+  ).toEqual([]);
+  expect(embeddedScripts("python3 -c 'print(1)'").map((script) => script.text)).toEqual([
+    "print(1)",
+  ]);
+});
 
 /** Each script's language, its text, and the part of the command that spells it. */
 function scriptsOf(command: string) {

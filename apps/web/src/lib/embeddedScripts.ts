@@ -1,4 +1,5 @@
 import { getFiletypeFromFileName } from "@pierre/diffs";
+import { MAX_SHELL_HIGHLIGHT_LENGTH } from "@t3tools/client-runtime/work-log/command-label";
 import {
   parse,
   type Command,
@@ -195,6 +196,7 @@ const DELIMITER_LANGUAGES: Record<string, string> = {
  * quote ends cannot be trusted.
  */
 export function embeddedScripts(command: string): EmbeddedScript[] {
+  if (command.length > MAX_SHELL_HIGHLIGHT_LENGTH) return [];
   const identity = Array.from({ length: command.length }, (_, index) => index);
   return scriptsIn(
     { text: command, starts: identity, ends: identity.map((index) => index + 1) },

@@ -40,6 +40,7 @@ export type RouteCheck = "answered" | "silent" | "unchecked";
 
 /** How long a direct route has to answer before it counts as unreachable from here. */
 const ROUTE_CHECK_TIMEOUT_MS = 2_500;
+export const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
 
 export class ConnectionDriver extends Context.Service<
   ConnectionDriver,
@@ -97,7 +98,23 @@ export const connectOverRoutes = Effect.fn("ConnectionDriver.connectOverRoutes")
   // Each route gets its own scope so a half-open session closes before the next try.
   const attempt = Effect.fnUntraced(function* (route: ConnectionRoute) {
     const routeScope = yield* Scope.fork(attemptScope);
-    const result = yield* connectRoute(route).pipe(
+    const connecting = connectRoute(route);
+    const bounded =
+      routes.length === 1
+        ? connecting
+        : connecting.pipe(
+            Effect.timeoutOrElse({
+              duration: CONNECTION_ESTABLISHMENT_TIMEOUT,
+              orElse: () =>
+                Effect.fail(
+                  new ConnectionTransientError({
+                    reason: "timeout",
+                    detail: `${entry.target.label} did not respond during connection setup.`,
+                  }),
+                ),
+            }),
+          );
+    const result = yield* bounded.pipe(
       Scope.provide(routeScope),
       Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Scope.close(routeScope, exit))),
       Effect.result,

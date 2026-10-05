@@ -209,16 +209,36 @@ const decodeStoredIcon = Schema.decodeUnknownEffect(StoredProjectIcon);
 const encodeStoredIcon = Schema.encodeEffect(StoredProjectIcon);
 const decodeReceivedIcon = Schema.decodeUnknownEffect(ReceivedProjectIcon);
 const encodeReceivedIcon = Schema.encodeEffect(ReceivedProjectIcon);
+const decodeOlderReceivedIcon = Schema.decodeUnknownEffect(
+  Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("lucide"),
+      name: Schema.String,
+      color: Schema.String,
+    }),
+    Schema.Struct({ kind: Schema.Literal("emoji"), emoji: Schema.String }),
+  ]),
+);
 const decodeProjectShell = Schema.decodeUnknownEffect(OrchestrationProjectShell);
 
-effectIt.effect("sends and stores icons in their plain shape", () =>
+effectIt.effect("stores icons plainly and sends a backward-compatible monogram", () =>
   Effect.gen(function* () {
     for (const icon of [
       { kind: "monogram", text: "क्ष्म", color: "violet" },
       { kind: "lucide", name: "alarm-clock", color: "blue" },
       { kind: "emoji", emoji: "🚀" },
     ] as const) {
-      assert.deepEqual(yield* encodeReceivedIcon(icon), icon);
+      const received = yield* encodeReceivedIcon(icon);
+      if (icon.kind === "monogram") {
+        assert.deepEqual(yield* decodeOlderReceivedIcon(received), {
+          kind: "lucide",
+          name: "folder-code",
+          color: icon.color,
+        });
+        assert.deepEqual(yield* decodeReceivedIcon(received), icon);
+      } else {
+        assert.deepEqual(received, icon);
+      }
       assert.deepEqual(yield* encodeStoredIcon(icon), icon);
       assert.deepEqual(yield* decodeReceivedIcon(icon), icon);
     }

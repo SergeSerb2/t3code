@@ -109,8 +109,8 @@ export type ProjectIconOverride = typeof ProjectIconOverride.Type;
 
 /**
  * Before v2, servers sent a monogram as a lucide icon carrying its text, so
- * older clients showed a folder. Icons stored then, and v2 servers released
- * before this change, still use that shape; it is read here, never written.
+ * older clients show a folder. The received-icon codec keeps that wire shape;
+ * stored icons use their plain shape, and the older monogram alias is still read.
  */
 const ProjectLucideIconWithLegacyMonogram = Schema.Struct({
   ...ProjectLucideIcon.fields,
@@ -155,7 +155,10 @@ export const ReceivedProjectIcon = ForwardCompatibleUnion(projectIconMembers, "k
       ProjectIconMember | UnknownUnionMember<"kind">
     >({
       decode: (icon) => (isUnknownUnionMember(icon) ? null : fromLegacyMonogram(icon)),
-      encode: (icon) => icon as ProjectIconMember,
+      encode: (icon) =>
+        icon?.kind === "monogram"
+          ? { kind: "lucide", name: "folder-code", color: icon.color, monogramText: icon.text }
+          : (icon as ProjectIconMember),
     }),
   ),
 );

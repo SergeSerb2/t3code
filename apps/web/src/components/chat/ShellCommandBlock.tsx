@@ -1,4 +1,5 @@
 import {
+  MAX_SHELL_HIGHLIGHT_LENGTH,
   commandHighlightLanguage,
   withVisibleControlCharacters,
 } from "@t3tools/client-runtime/work-log/command-label";
@@ -62,6 +63,9 @@ export function ShellCommandBlock({ command }: { command: string }) {
   const { resolvedTheme } = useTheme();
   const code = withVisibleControlCharacters(command.trim());
   if (!code) return null;
+  if (code.length > MAX_SHELL_HIGHLIGHT_LENGTH) {
+    return <div className="text-foreground/85">{code}</div>;
+  }
   const plain = <PlainWords code={code} />;
   return (
     // The tool body sets the monospace, pre-wrapped text this sits in.

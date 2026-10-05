@@ -1,6 +1,7 @@
 type CommandWrapper = "env" | "sudo";
 type CommandProgramContext = "exec" | "shell";
 
+export const MAX_SHELL_HIGHLIGHT_LENGTH = 16_384;
 const MAX_COMMAND_SEGMENTS = 64;
 
 const SHELL_PROGRAMS = new Set(["sh", "bash", "zsh", "dash", "ash", "ksh", "fish"]);

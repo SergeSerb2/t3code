@@ -18,6 +18,7 @@ import {
   BearerConnectionRegistration,
   type ConnectionCatalogEntry,
   type ConnectionCredential,
+  type ConnectionRoute,
   SshConnectionProfile,
   SshConnectionRegistration,
 } from "./catalog.ts";
@@ -32,7 +33,7 @@ import {
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentRegistry from "./registry.ts";
 import { orchestrationProtocolCompatibilityError } from "./compatibility.ts";
-import { connectionRoutes, routeEntry, sshTargetKey } from "./routes.ts";
+import { connectionRoutes, isLearned, routeEntry, sshTargetKey } from "./routes.ts";
 
 export interface PairingConnectionInput {
   readonly pairingUrl?: string;
@@ -167,20 +168,22 @@ const registerPairingConnection = Effect.fn(
 const isBearerCredential = Schema.is(BearerConnectionCredential);
 const isBearerProfile = Schema.is(BearerConnectionProfile);
 
+export const selectEditableBearerRoute = (
+  entry: ConnectionCatalogEntry,
+): ConnectionRoute | undefined =>
+  connectionRoutes(entry).find(
+    (route) => route.target._tag === "BearerConnectionTarget" && !isLearned(route),
+  );
+
 const updateBearerConnection = Effect.fn(
   "clientRuntime.connection.onboarding.updateBearerConnection",
 )(function* (input: BearerConnectionUpdateInput) {
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
   const saved = (yield* SubscriptionRef.get(registry.entries)).get(input.environmentId);
-  // Editing changes the environment's first direct route; others stay as saved.
-  const route =
-    saved === undefined
-      ? undefined
-      : connectionRoutes(saved).find(
-          (candidate) => candidate.target._tag === "BearerConnectionTarget",
-        );
-  const entry = saved === undefined || route === undefined ? saved : routeEntry(saved, route);
+  // Learned routes borrow their source's credential and cannot be edited independently.
+  const route = saved === undefined ? undefined : selectEditableBearerRoute(saved);
+  const entry = saved === undefined || route === undefined ? undefined : routeEntry(saved, route);
   const credential =
     entry?.target._tag === "BearerConnectionTarget"
       ? yield* credentials.get(entry.target.connectionId)

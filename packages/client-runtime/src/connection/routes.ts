@@ -13,6 +13,17 @@ import {
 } from "./catalog.ts";
 import { BearerConnectionTarget, type ConnectionTarget } from "./model.ts";
 
+/** A drag order expires when saved, or when the catalog replaces any route. */
+export function reconcilePendingRouteOrder(
+  pending: ReadonlyArray<string> | null,
+  saved: ReadonlyArray<string>,
+): ReadonlyArray<string> | null {
+  if (pending === null || pending.length !== saved.length) return null;
+  const savedIds = new Set(saved);
+  if (pending.some((id) => !savedIds.has(id))) return null;
+  return pending.every((id, index) => id === saved[index]) ? null : pending;
+}
+
 /**
  * A saved environment can hold several routes: T3 Connect, direct URLs (LAN,
  * tailnet, public), and SSH. The client connects over the first route in

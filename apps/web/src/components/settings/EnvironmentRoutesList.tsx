@@ -23,9 +23,10 @@ import {
   connectionRouteLabel,
   connectionRoutes,
   isLearned,
+  reconcilePendingRouteOrder,
 } from "@t3tools/client-runtime/connection";
 import { GripVerticalIcon, PlusIcon, XIcon } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { requestConfirmDialog } from "~/confirmDialog";
 import { environmentCatalog } from "~/connection/catalog";
@@ -53,12 +54,11 @@ export function EnvironmentRoutesList({
   // A dropped order shows until the catalog matches it, so the row does not
   // jump back while the reorder is being saved.
   const [pending, setPending] = useState<ReadonlyArray<string> | null>(null);
-  const order: Array<string> =
-    pending !== null &&
-    pending.length === savedIds.length &&
-    pending.some((id, index) => id !== savedIds[index])
-      ? [...pending]
-      : savedIds;
+  const pendingOrder = reconcilePendingRouteOrder(pending, savedIds);
+  const order = [...(pendingOrder ?? savedIds)];
+  useEffect(() => {
+    if (pending !== null && pendingOrder === null) setPending(null);
+  }, [pending, pendingOrder]);
   const byId = new Map(saved.map((route) => [connectionRouteId(route.target), route]));
   const routes = order.flatMap((id) => byId.get(id) ?? []);
 

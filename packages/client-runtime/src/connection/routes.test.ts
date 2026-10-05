@@ -18,6 +18,7 @@ import {
   insertRoute,
   entryWithRoutes,
   mergeLearnedRoutes,
+  reconcilePendingRouteOrder,
   removedWithRelay,
   routesAfterRemoving,
   upsertRoute,
@@ -53,6 +54,14 @@ const TAILNET = direct("tailnet", "https://desk.tail1234.ts.net/");
 const PUBLIC = direct("public", "https://desk.example.com/");
 
 describe("connection routes", () => {
+  it("retires a pending reorder when persisted and rejects replacement route IDs", () => {
+    const pending = ["tailnet", "lan"];
+    expect(reconcilePendingRouteOrder(pending, ["lan", "tailnet"])).toBe(pending);
+    expect(reconcilePendingRouteOrder(pending, ["tailnet", "lan"])).toBeNull();
+    expect(reconcilePendingRouteOrder(pending, ["tailnet", "new-lan"])).toBeNull();
+    expect(reconcilePendingRouteOrder(pending, ["tailnet"])).toBeNull();
+    expect(reconcilePendingRouteOrder(null, ["tailnet", "new-lan"])).toBeNull();
+  });
   it("classifies direct routes by address", () => {
     expect(connectionRouteKind(LAN)).toBe("lan");
     expect(connectionRouteKind(direct("ip", "http://100.101.102.103:3773/"))).toBe("tailnet");

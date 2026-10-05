@@ -16,7 +16,9 @@ import {
   prepareBearerConnectionUpdate,
   preparePairingRegistration,
   prepareSshRegistration,
+  selectEditableBearerRoute,
 } from "./onboarding.ts";
+import { entryWithRoutes } from "./routes.ts";
 
 const CLIENT_PRESENTATION_LAYER = Layer.succeed(
   ClientCapabilities.ClientPresentation,
@@ -85,6 +87,35 @@ function pairingHttpLayer(
 }
 
 describe("connection onboarding", () => {
+  it("edits the saved bearer route behind a higher-ranked learned route", () => {
+    const environmentId = EnvironmentId.make("environment-editable");
+    const target = new BearerConnectionTarget({
+      environmentId,
+      label: "Desk",
+      connectionId: "saved",
+    });
+    const profile = new BearerConnectionProfile({
+      environmentId,
+      label: "Desk",
+      connectionId: "saved",
+      httpBaseUrl: "https://desk.example.com/",
+      wsBaseUrl: "wss://desk.example.com/",
+    });
+    const saved = { target, profile: Option.some(profile) };
+    const learned = {
+      target: new BearerConnectionTarget({ ...target, connectionId: "learned:saved:tailnet" }),
+      profile: Option.some(
+        new BearerConnectionProfile({
+          ...profile,
+          connectionId: "learned:saved:tailnet",
+          learned: true,
+        }),
+      ),
+    };
+    const entry = entryWithRoutes({ ...saved, enabled: true }, [learned, saved]);
+    expect(selectEditableBearerRoute(entry)).toMatchObject({ target: { connectionId: "saved" } });
+    expect(selectEditableBearerRoute(entryWithRoutes(entry, [learned]))).toBeUndefined();
+  });
   it.effect("prepares a persisted bearer registration from pairing details", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];

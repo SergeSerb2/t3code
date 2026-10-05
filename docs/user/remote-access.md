@@ -70,12 +70,10 @@ next to it in the T3 Connect list. Pairing the same machine again over another
 address also adds a route instead of a second machine. A new route is placed by
 speed, in that order, and you can reorder routes at any time.
 
-While connected through T3 Connect or a paired address, T3 Code also learns the
-machine's current LAN and Tailscale addresses and adds them as routes, so
-pairing once through T3 Connect is enough to use the LAN at home. When the
-machine's LAN address changes, for example after it joins another Wi-Fi network,
-the learned route follows it. The machine must allow network access for its LAN
-address to be learned. You can reorder a learned route, but not remove it; it
+While connected through T3 Connect or a paired address, T3 Code also learns
+advertised HTTPS addresses, such as a verified Tailscale Serve endpoint, and
+adds them as routes. Plain HTTP LAN addresses are not learned automatically;
+pair a direct LAN address explicitly if you want to use it. You can reorder a learned route, but not remove it; it
 goes away with the route it was learned through, or when the machine stops
 reporting that address.
 

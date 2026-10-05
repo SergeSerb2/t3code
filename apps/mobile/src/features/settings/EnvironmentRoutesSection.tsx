@@ -8,6 +8,7 @@ import {
   connectionRouteLabel,
   connectionRoutes,
   isLearned,
+  reconcilePendingRouteOrder,
 } from "@t3tools/client-runtime/connection";
 import type { EnvironmentId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
@@ -63,12 +64,11 @@ export function EnvironmentRoutesSection({
   const savedIds = saved.map((route) => connectionRouteId(route.target));
   // A dropped order shows until the catalog matches it.
   const [pending, setPending] = useState<ReadonlyArray<string> | null>(null);
-  const order =
-    pending !== null &&
-    pending.length === savedIds.length &&
-    pending.some((id, index) => id !== savedIds[index])
-      ? pending
-      : savedIds;
+  const pendingOrder = reconcilePendingRouteOrder(pending, savedIds);
+  const order = pendingOrder ?? savedIds;
+  useEffect(() => {
+    if (pending !== null && pendingOrder === null) setPending(null);
+  }, [pending, pendingOrder]);
   const [drag, setDrag] = useState<{ readonly id: string; readonly translation: number } | null>(
     null,
   );

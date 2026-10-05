@@ -45,6 +45,10 @@ export class DirectEndpoints extends Context.Service<
   }
 >()("t3/environment/DirectEndpoints") {}
 
+/** Automatic routes carry credentials and must retain transport encryption. */
+export const secureAdvertisedEndpoints = (endpoints: ReadonlyArray<ServerDirectEndpoint>) =>
+  endpoints.filter((endpoint) => new URL(endpoint.httpBaseUrl).protocol === "https:");
+
 /**
  * Only numeric private-network and tailnet IPv4 addresses are reported. These
  * routes are plain HTTP and carry the client's credential, so a public address
@@ -134,7 +138,7 @@ export const make = Effect.gen(function* () {
         endpoints.push({ kind: "tailnet", httpBaseUrl: servedUrl.value });
       }
     }
-    return endpoints;
+    return secureAdvertisedEndpoints(endpoints);
   });
 
   return DirectEndpoints.of({ resolve: () => resolve });

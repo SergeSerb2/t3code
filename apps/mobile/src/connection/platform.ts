@@ -25,6 +25,7 @@ import { authClientMetadata } from "../lib/authClientMetadata";
 import * as Runtime from "../lib/runtime";
 import * as MobileStorage from "../persistence/mobile-storage";
 import { appAtomRegistry } from "../state/atom-registry";
+import { createNetworkPathTracker } from "./network-path-tracker";
 import { clearThreadOutboxEnvironment } from "../state/thread-outbox-removal";
 import { clearComposerDraftsEnvironment } from "../state/use-composer-drafts";
 import { clearThreadComposerErrorsForEnvironment } from "../state/thread-composer-error";
@@ -93,20 +94,19 @@ const networkPathChanges = Stream.callback<"network-changed">((queue) =>
   Effect.acquireRelease(
     Effect.sync(() => {
       let active = true;
-      let previous: Network.NetworkStateType | undefined;
+      const tracker = createNetworkPathTracker<Network.NetworkStateType>();
       const record = (state: Network.NetworkState) => {
         const type = state.isConnected === true ? state.type : undefined;
-        if (previous !== undefined && type !== undefined && type !== previous) {
+        if (active && tracker.record(type)) {
           Queue.offerUnsafe(queue, "network-changed");
         }
-        previous = type ?? previous;
       };
       // The listener reports changes only, so seed the current type; without
       // it the first Wi-Fi to cellular move would go unnoticed.
       void Network.getNetworkStateAsync()
         .then((state) => {
-          if (active && previous === undefined && state.isConnected === true) {
-            previous = state.type;
+          if (active && state.isConnected === true) {
+            tracker.seed(state.type);
           }
         })
         .catch(() => undefined);

@@ -12,7 +12,21 @@ import { describe, expect, it } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import * as DirectEndpoints from "./DirectEndpoints.ts";
-import { resolveBoundEndpoints } from "./DirectEndpoints.ts";
+import { resolveBoundEndpoints, secureAdvertisedEndpoints } from "./DirectEndpoints.ts";
+
+it("only advertises encrypted endpoints for automatic learning", () => {
+  expect(
+    secureAdvertisedEndpoints([
+      { kind: "lan", httpBaseUrl: "http://192.168.1.10:3773/" },
+      { kind: "tailnet", httpBaseUrl: "http://100.64.1.2:3773/" },
+      { kind: "tailnet", httpBaseUrl: "https://desk.tail1234.ts.net/" },
+      { kind: "lan", httpBaseUrl: "https://desk.example.com/" },
+    ]),
+  ).toEqual([
+    { kind: "tailnet", httpBaseUrl: "https://desk.tail1234.ts.net/" },
+    { kind: "lan", httpBaseUrl: "https://desk.example.com/" },
+  ]);
+});
 
 const INTERFACES: ReturnType<typeof NodeOS.networkInterfaces> = {
   lo0: [

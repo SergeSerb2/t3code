@@ -1,8 +1,15 @@
 import * as DateTime from "effect/DateTime";
+import { ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import {
+  FetchHttpClient,
+  HttpClient,
+  HttpClientRequest,
+  HttpClientResponse,
+} from "effect/unstable/http";
 
 import { writeFileStringAtomically } from "./atomicWrite.ts";
 import type * as ServerConfig from "./config.ts";
@@ -126,6 +133,23 @@ export const isProcessAlive = (pid: number): boolean => {
     return error instanceof Error && "code" in error && error.code === "EPERM";
   }
 };
+
+/** A reused PID alone is not evidence that the recorded T3 server still owns its origin. */
+export const isRecordedServerResponding = (state: PersistedServerRuntimeState) =>
+  Effect.gen(function* () {
+    const url = yield* Effect.try(() => new URL("/.well-known/t3/environment", state.origin));
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return false;
+    const client = yield* HttpClient.HttpClient;
+    const response = yield* client.execute(HttpClientRequest.get(url.toString()));
+    yield* HttpClientResponse.filterStatusOk(response).pipe(
+      Effect.flatMap(HttpClientResponse.schemaBodyJson(ExecutionEnvironmentDescriptor)),
+    );
+    return true;
+  }).pipe(
+    Effect.timeoutOrElse({ duration: 2_500, orElse: () => Effect.succeed(false) }),
+    Effect.orElseSucceed(() => false),
+    Effect.provide(FetchHttpClient.layer),
+  );
 
 export const readPersistedServerRuntimeState = (path: string) =>
   Effect.gen(function* () {

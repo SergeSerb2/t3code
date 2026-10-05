@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 
 import { assert, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -79,6 +80,101 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         }),
     );
   });
+
+  it.effect("keeps stale records and supervised startup out of the manual launch preflight", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cli-preflight-" });
+      for (const [name, pid, mode, rejectRunningServer] of [
+        ["stale", 2_147_483_647, "web", true],
+        ["desktop", process.pid, "desktop", true],
+        ["serve", process.pid, "web", false],
+      ] as const) {
+        const baseDir = path.join(root, name);
+        const stateDir = path.join(baseDir, "userdata");
+        yield* fs.makeDirectory(stateDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(stateDir, "server-runtime.json"),
+          yield* encodeUnknownJson({
+            version: 1,
+            pid,
+            port: 3773,
+            origin: "http://127.0.0.1:3773",
+            startedAt: "2026-10-01T00:00:00.000Z",
+          }),
+        );
+        const cwd = path.join(root, `${name}-project`);
+        const config = yield* resolveServerConfig(
+          {
+            ...minimalWebFlags(baseDir),
+            mode: Option.some(mode),
+            port: Option.some(8788),
+            cwd: Option.some(cwd),
+          },
+          Option.none(),
+          { rejectRunningServer },
+        ).pipe(
+          Effect.provide(
+            Layer.merge(
+              NetService.layer,
+              ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })),
+            ),
+          ),
+        );
+        expect(config.cwd).toBe(cwd);
+        expect(yield* fs.exists(cwd)).toBe(true);
+      }
+    }),
+  );
+
+  it.effect("does not mistake a reused PID for a responding T3 server", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cli-reused-pid-" });
+      const stateDir = path.join(baseDir, "userdata");
+      yield* fs.makeDirectory(stateDir, { recursive: true });
+      yield* fs.writeFileString(
+        path.join(stateDir, "server-runtime.json"),
+        yield* encodeUnknownJson({
+          version: 1,
+          pid: process.pid,
+          port: 3773,
+          origin: "http://127.0.0.1:3773",
+          startedAt: "2026-10-01T00:00:00.000Z",
+        }),
+      );
+      const probe = yield* Effect.acquireRelease(
+        Effect.sync(() => vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}"))),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const resolve = resolveServerConfig(
+        { ...minimalWebFlags(baseDir), port: Option.some(8788) },
+        Option.none(),
+        { rejectRunningServer: true },
+      ).pipe(
+        Effect.provide(
+          Layer.merge(NetService.layer, ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
+        ),
+      );
+      const config = yield* resolve;
+      expect(config.baseDir).toBe(baseDir);
+      expect(probe).toHaveBeenCalledTimes(1);
+      probe.mockResolvedValue(
+        new Response(
+          yield* encodeUnknownJson({
+            environmentId: "runtime-test",
+            label: "Runtime",
+            platform: { os: "linux", arch: "x64" },
+            serverVersion: "0.0.46",
+            capabilities: { repositoryIdentity: true },
+          }),
+        ),
+      );
+      expect((yield* Effect.exit(resolve))._tag).toBe("Failure");
+    }),
+  );
 
   it.effect("enables a trimmed reusable auth token only for web dev mode", () =>
     Effect.gen(function* () {

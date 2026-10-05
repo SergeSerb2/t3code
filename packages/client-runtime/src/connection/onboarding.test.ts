@@ -16,7 +16,9 @@ import {
   prepareBearerConnectionUpdate,
   preparePairingRegistration,
   prepareSshRegistration,
+  selectEditableBearerRoute,
 } from "./onboarding.ts";
+import { entryWithRoutes } from "./routes.ts";
 
 const CLIENT_PRESENTATION_LAYER = Layer.succeed(
   ClientCapabilities.ClientPresentation,
@@ -85,6 +87,35 @@ function pairingHttpLayer(
 }
 
 describe("connection onboarding", () => {
+  it("edits the saved bearer route behind a higher-ranked learned route", () => {
+    const environmentId = EnvironmentId.make("environment-editable");
+    const target = new BearerConnectionTarget({
+      environmentId,
+      label: "Desk",
+      connectionId: "saved",
+    });
+    const profile = new BearerConnectionProfile({
+      environmentId,
+      label: "Desk",
+      connectionId: "saved",
+      httpBaseUrl: "https://desk.example.com/",
+      wsBaseUrl: "wss://desk.example.com/",
+    });
+    const saved = { target, profile: Option.some(profile) };
+    const learned = {
+      target: new BearerConnectionTarget({ ...target, connectionId: "learned:saved:tailnet" }),
+      profile: Option.some(
+        new BearerConnectionProfile({
+          ...profile,
+          connectionId: "learned:saved:tailnet",
+          learned: true,
+        }),
+      ),
+    };
+    const entry = entryWithRoutes({ ...saved, enabled: true }, [learned, saved]);
+    expect(selectEditableBearerRoute(entry)).toMatchObject({ target: { connectionId: "saved" } });
+    expect(selectEditableBearerRoute(entryWithRoutes(entry, [learned]))).toBeUndefined();
+  });
   it.effect("prepares a persisted bearer registration from pairing details", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
@@ -98,12 +129,12 @@ describe("connection onboarding", () => {
         target: {
           environmentId: "environment-paired",
           label: "Paired environment",
-          connectionId: "bearer:environment-paired",
+          connectionId: "bearer:environment-paired:https://remote.example.test",
         },
         profile: {
           environmentId: "environment-paired",
           label: "Paired environment",
-          connectionId: "bearer:environment-paired",
+          connectionId: "bearer:environment-paired:https://remote.example.test",
           httpBaseUrl: "https://remote.example.test/",
           wsBaseUrl: "wss://remote.example.test/",
         },
@@ -144,6 +175,25 @@ describe("connection onboarding", () => {
         Effect.flip,
       );
       expect(error).toMatchObject({ reason: "unsupported" });
+      expect(calls.map((call) => call.url)).toEqual([
+        "https://remote.example.test/.well-known/t3/environment",
+      ]);
+    }),
+  );
+
+  it.effect("refuses to add a route that reaches a different machine, keeping the code", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+      const error = yield* preparePairingRegistration({
+        host: "remote.example.test",
+        pairingCode: "pairing-token",
+        expectedEnvironmentId: EnvironmentId.make("some-other-machine"),
+      }).pipe(
+        Effect.provide(Layer.mergeAll(CLIENT_PRESENTATION_LAYER, pairingHttpLayer(calls))),
+        Effect.flip,
+      );
+      expect(error).toMatchObject({ reason: "configuration" });
+      expect(error.message).toContain("different machine");
       expect(calls.map((call) => call.url)).toEqual([
         "https://remote.example.test/.well-known/t3/environment",
       ]);
@@ -321,12 +371,12 @@ describe("connection onboarding", () => {
         target: {
           environmentId: "environment-ssh",
           label: "Remote development box",
-          connectionId: "ssh:environment-ssh",
+          connectionId: 'ssh:environment-ssh:["devbox","devbox.example.test","developer",22]',
         },
         profile: {
           environmentId: "environment-ssh",
           label: "Remote development box",
-          connectionId: "ssh:environment-ssh",
+          connectionId: 'ssh:environment-ssh:["devbox","devbox.example.test","developer",22]',
           target,
         },
       });

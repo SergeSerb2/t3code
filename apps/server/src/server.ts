@@ -15,11 +15,12 @@ import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as Schedule from "effect/Schedule";
-import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
-import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import { FetchHttpClient, HttpRouter, HttpServer } from "effect/http";
+import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as HostPowerMonitor from "./background/HostPowerMonitor.ts";
@@ -32,7 +33,7 @@ import {
   staticAndDevRouteLayer,
   browserApiCorsLayer,
   httpCompressionLayer,
-  untracedRequestsLayer,
+  withUntracedRequests,
 } from "./http.ts";
 import { guardHttpResponseWriteErrors } from "./httpResponseErrorGuard.ts";
 import { fixPath } from "./os-jank.ts";
@@ -111,12 +112,25 @@ import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import { ObservabilityLive } from "./observability/Layers/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
+import { readEnvironmentKeyPair } from "./cloud/environmentKeys.ts";
+import { signRelayHookHoldUrl } from "@t3tools/shared/relayJwt";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import { authHttpApiLayer, environmentAuthenticatedAuthLayer } from "./auth/http.ts";
 import * as ReplayMarkers from "./auth/replayMarkers.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+import { webhookHttpApiLayer } from "./scheduledTasks/webhookRoute.ts";
+import * as HeldHooksWaker from "./relay/HeldHooksWaker.ts";
+import {
+  relayHookBaseUrl,
+  ScheduledTaskWebhookOrigin,
+} from "./scheduledTasks/ScheduledTaskService.ts";
+import {
+  CLOUD_ENDPOINT_RUNTIME_CONFIG,
+  decodeRuntimeConfig,
+  RELAY_URL_SECRET,
+} from "./cloud/config.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
   connectHttpApiLayer,
@@ -444,7 +458,44 @@ const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
   ),
 );
 
+// Webhook URLs go through the relay only when the managed tunnel it forwards
+// to is configured; otherwise clients show the environment-relative path.
+const ScheduledTaskWebhookOriginLive = Layer.effect(
+  ScheduledTaskWebhookOrigin,
+  Effect.gen(function* () {
+    const secrets = yield* ServerSecretStore.ServerSecretStore;
+    // The reference holds an effect so each read sees the current link state.
+    return Effect.gen(function* () {
+      const [relayUrl, tunnelConfig] = yield* Effect.all([
+        secrets.get(RELAY_URL_SECRET),
+        secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG),
+      ]).pipe(Effect.orElseSucceed(() => [Option.none(), Option.none()] as const));
+      if (Option.isNone(relayUrl) || Option.isNone(tunnelConfig)) {
+        return { relayHookBaseUrl: null };
+      }
+      const config = decodeRuntimeConfig(new TextDecoder().decode(tunnelConfig.value));
+      // Read the existing link key only. Listing webhook URLs must never create credentials.
+      const keys = yield* readEnvironmentKeyPair(secrets).pipe(Effect.orElseSucceed(Option.none));
+      return {
+        ...(Option.isSome(keys)
+          ? {
+              signWebhookUrl: (url: string) =>
+                signRelayHookHoldUrl(url, keys.value.privateKey).pipe(
+                  Effect.orElseSucceed(() => url),
+                ),
+            }
+          : {}),
+        relayHookBaseUrl: relayHookBaseUrl({
+          relayUrl: new TextDecoder().decode(relayUrl.value),
+          tunnelName: Option.isSome(config) ? config.value.tunnelName : undefined,
+        }),
+      };
+    });
+  }),
+);
+
 const OrchestrationV2RuntimeLayerLive = OrchestrationV2ProductionLayerLive.pipe(
+  Layer.provide(ScheduledTaskWebhookOriginLive),
   Layer.provide(ProviderEventIngestor.analyticsLive),
   Layer.provide(CheckpointStoreLayerLive),
   Layer.provide(GitWorkflowLayerLive),
@@ -508,6 +559,8 @@ const ProviderInstallationRefreshLive = Layer.effectDiscard(
 
 const RuntimeCoreDependenciesBaseLive = Layer.mergeAll(
   AgentAwarenessRelay.layer,
+  // Asks T3 Connect to deliver webhooks it held while this environment was offline.
+  HeldHooksWaker.layer,
   ThreadSettlementWorkerLive,
   Layer.effectDiscard(StorageCleanup.make.pipe(Effect.flatMap((service) => service.start()))).pipe(
     Layer.provide(ProjectionStoreV2.layer),
@@ -643,6 +696,7 @@ const makeRoutesLayer = Layer.mergeAll(
       Layer.provide(pullRequestHttpApiLayer),
       Layer.provide(projectHttpApiLayer),
       Layer.provide(serverEnvironmentHttpApiLayer),
+      Layer.provide(webhookHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),
     ),
     otlpTracesProxyRouteLayer,
@@ -660,8 +714,6 @@ const makeRoutesLayer = Layer.mergeAll(
   McpHttpServer.layer.pipe(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
   ),
-  // Last, so no route layer can replace the server's one TracerDisabledWhen.
-  untracedRequestsLayer,
 ).pipe(
   // Both transports consume the same service instance, so caches single-flight across clients
   // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
@@ -1012,7 +1064,10 @@ const makeServerLayer = Layer.unwrap(
     const routesLayer = HttpRouter.serve(makeRoutesLayer.pipe(Layer.provide(launcherLayer)), {
       disableLogger: !config.logWebSocketEvents,
       routerConfig: HTTP_ROUTER_CONFIG,
-    }).pipe(Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)));
+    }).pipe(
+      withUntracedRequests,
+      Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)),
+    );
     const serverApplicationLayer = Layer.mergeAll(
       routesLayer,
       httpListeningLayer,

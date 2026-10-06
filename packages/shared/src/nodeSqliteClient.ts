@@ -10,7 +10,6 @@ import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as Fiber from "effect/Fiber";
 import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Predicate from "effect/Predicate";
@@ -19,11 +18,11 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Context from "effect/Context";
 import * as Stream from "effect/Stream";
-import * as Reactivity from "effect/unstable/reactivity/Reactivity";
-import * as Client from "effect/unstable/sql/SqlClient";
-import type { Connection } from "effect/unstable/sql/SqlConnection";
-import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
-import * as Statement from "effect/unstable/sql/Statement";
+import * as Reactivity from "effect/reactivity/Reactivity";
+import * as Client from "effect/sql/SqlClient";
+import type { Connection } from "effect/sql/SqlConnection";
+import { SqlError, classifySqliteError } from "effect/sql/SqlError";
+import * as Statement from "effect/sql/Statement";
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
 
@@ -262,20 +261,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
   const semaphore = yield* Semaphore.make(1);
   const connection = yield* makeConnection;
 
-  const acquirer = semaphore.withPermits(1)(Effect.succeed(connection));
-  const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
-    const fiber = Fiber.getCurrent()!;
-    const scope = Context.getUnsafe(fiber.context, Scope.Scope);
-    return Effect.as(
-      Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
-      connection,
-    );
+  // SQLite may leave a failed COMMIT open. The shared Effect acquirers roll
+  // it back before releasing this connection, and reject it if cleanup fails.
+  const acquirers = Client.makeSqliteAcquirers({
+    connection: Effect.succeed(connection),
+    semaphore,
   });
 
   return yield* Client.make({
-    acquirer,
+    ...acquirers,
     compiler,
-    transactionAcquirer,
     // A deferred BEGIN only takes the write lock at the first write. If another
     // process commits after this transaction's first read, that write fails at
     // once with SQLITE_BUSY_SNAPSHOT, which busy_timeout cannot wait out. Taking

@@ -1,12 +1,20 @@
 import {
   CommandId,
   MessageId,
+  PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ScheduledTask,
   ScheduledTaskError,
   ScheduledTaskId,
   ThreadId,
+  ScheduledTaskWebhookDeliveryId,
   type ScheduledTaskDeleteInput,
   type ScheduledTaskDeleteResult,
+  type ScheduledTaskGetWebhookDeliveryInput,
+  type ScheduledTaskGetWebhookDeliveryResult,
+  type ScheduledTaskListWebhookDeliveriesInput,
+  type ScheduledTaskListWebhookDeliveriesResult,
+  type ScheduledTaskRotateWebhookTokenInput,
+  type ScheduledTaskWebhookDeliveryOutcome,
   type ScheduledTaskListResult,
   type ScheduledTaskMutationResult,
   type ScheduledTaskRunNowInput,
@@ -17,21 +25,139 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Duration from "effect/Duration";
+import * as Metric from "effect/Metric";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
+import {
+  redactHeaders,
+  redactQuery,
+  renderWebhookPrompt,
+  type WebhookRequest,
+} from "./webhookTemplate.ts";
+import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerification.ts";
+
+/** Path prefix of the environment route that receives webhook requests. */
+export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
+/** Deliveries kept per task; older ones are pruned on insert. */
+const WEBHOOK_DELIVERY_RETENTION = 50;
+/** Body text kept in the delivery log. Larger bodies are cut and flagged. */
+const WEBHOOK_DELIVERY_LOG_BODY_LIMIT = 64 * 1024;
+/** Rendered prompt text kept in the delivery log. */
+const WEBHOOK_DELIVERY_LOG_PROMPT_LIMIT = 64 * 1024;
+/** Deliveries one task may hold at once, running or waiting their turn. */
+const WEBHOOK_MAX_QUEUED_PER_TASK = 20;
+/** Stop a permanently failing delivery from occupying the queue forever. */
+const WEBHOOK_MAX_DISPATCH_ATTEMPTS = 5;
+/** Accepted deliveries per task per minute, enforced here as well as on the relay because the tunnel hostname is public too. */
+const WEBHOOK_RATE_LIMIT_PER_MINUTE = 60;
+
+/**
+ * Where a webhook task's public URL points: `${relayHookBaseUrl}/${taskId}/${token}`.
+ * Null when the environment has no managed tunnel on T3 Connect; clients then show the path.
+ */
+interface WebhookOrigin {
+  readonly relayHookBaseUrl: string | null;
+  readonly signWebhookUrl?: (url: string) => Effect.Effect<string>;
+}
+
+const ENDPOINT_KEY = /^[0-9a-f]{16}$/;
+
+/**
+ * The relay's hook URL prefix for this environment. The relay finds the
+ * environment by its managed tunnel's key (the tunnel name's last segment),
+ * so the URL never reveals the environment id.
+ */
+export function relayHookBaseUrl(input: {
+  readonly relayUrl: string;
+  readonly tunnelName: string | undefined;
+}): string | null {
+  const endpointKey = input.tunnelName?.split("-").at(-1);
+  const relayUrl = input.relayUrl.replace(/\/+$/, "");
+  if (relayUrl === "" || endpointKey === undefined || !ENDPOINT_KEY.test(endpointKey)) {
+    return null;
+  }
+  return `${relayUrl}/v1/hooks/${endpointKey}`;
+}
+
+export class ScheduledTaskWebhookOrigin extends Context.Reference<Effect.Effect<WebhookOrigin>>(
+  "t3/scheduledTasks/ScheduledTaskWebhookOrigin",
+  {
+    defaultValue: () => Effect.succeed({ relayHookBaseUrl: null }),
+  },
+) {}
+
+/** A queued webhook delivery that no longer applies to its task; `reason` is shown in the delivery log. */
+class WebhookDeliverySkipped extends Data.TaggedError("WebhookDeliverySkipped")<{
+  readonly reason: string;
+}> {}
+
+interface RateWindow {
+  readonly accepted: ReadonlyArray<number>;
+  /** Whether a rejection was already logged in this window. */
+  readonly rejectedLogged: boolean;
+}
+
+export interface WebhookTriggerRequest extends WebhookRequest {
+  readonly hookId: string;
+  readonly token: string;
+  readonly body: Uint8Array;
+  /** Set by T3 Connect; the same id is never dispatched twice. */
+  readonly relayDeliveryId?: string;
+  /** When the relay received a held request; defaults to now. */
+  readonly receivedAt?: string;
+}
+
+/** What the HTTP route should answer. `not_found` covers unknown hooks and wrong tokens alike. */
+/**
+ * What happened to one webhook request, as recorded in metrics and spans.
+ * Sent back to the relay as `x-t3-hook-outcome`; never request contents.
+ */
+export type WebhookDeliveryOutcome =
+  | "accepted"
+  | "duplicate"
+  | "prompt_too_long"
+  | "queue_full"
+  | "rate_limited"
+  | "disabled"
+  | "rejected_signature"
+  | "expired"
+  | "not_found"
+  | "error";
+
+export type WebhookTriggerResult =
+  | {
+      readonly _tag: "accepted";
+      readonly deliveryId: ScheduledTaskWebhookDeliveryId;
+      /** A 202 covers more than a started run; this says which. */
+      readonly outcome: "accepted" | "duplicate" | "prompt_too_long";
+    }
+  | { readonly _tag: "not_found" }
+  | { readonly _tag: "rejected_signature" }
+  | { readonly _tag: "disabled" }
+  | {
+      readonly _tag: "rate_limited";
+      /** Too many requests to this hook, or too many runs already waiting. */
+      readonly outcome: "rate_limited" | "queue_full";
+    }
+  | { readonly _tag: "expired" };
 
 const decodeTask = Schema.decodeUnknownEffect(ScheduledTask);
 const decodeTaskId = Schema.decodeUnknownOption(ScheduledTaskId);
@@ -44,6 +170,12 @@ const decodeWorkspaceStrategyJson = Schema.decodeUnknownEffect(
 const decodeModelSelectionJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ScheduledTask.fields.modelSelection),
 );
+const HeadersJson = Schema.fromJsonString(Schema.Record(Schema.String, Schema.String));
+const MissingFieldsJson = Schema.fromJsonString(Schema.Array(Schema.String));
+const decodeHeadersJson = Schema.decodeUnknownOption(HeadersJson);
+const decodeMissingFieldsJson = Schema.decodeUnknownOption(MissingFieldsJson);
+const encodeHeadersJson = Schema.encodeSync(HeadersJson);
+const encodeMissingFieldsJson = Schema.encodeSync(MissingFieldsJson);
 
 interface ScheduledTaskRow {
   readonly task_id: string;
@@ -66,6 +198,25 @@ interface ScheduledTaskRow {
   readonly last_run_status: string;
   readonly last_run_error: string | null;
   readonly run_count: number;
+  readonly webhook_token: string | null;
+  readonly webhook_secret: string | null;
+}
+
+interface WebhookDeliveryRow {
+  readonly delivery_id: string;
+  readonly task_id: string;
+  readonly received_at: string;
+  readonly method: string;
+  readonly query: string;
+  readonly headers_json: string;
+  readonly body: string;
+  readonly body_bytes: number;
+  readonly body_truncated: number;
+  readonly outcome: string;
+  readonly signature_verified: number;
+  readonly missing_fields_json: string;
+  readonly rendered_prompt: string | null;
+  readonly error: string | null;
 }
 
 export class ScheduledTaskService extends Context.Service<
@@ -87,6 +238,24 @@ export class ScheduledTaskService extends Context.Service<
     readonly runNow: (
       input: ScheduledTaskRunNowInput,
     ) => Effect.Effect<ScheduledTaskRunNowResult, ScheduledTaskError>;
+    /** Issues a new URL token for a webhook task; the old URL stops working at once. */
+    readonly rotateWebhookToken: (
+      input: ScheduledTaskRotateWebhookTokenInput,
+    ) => Effect.Effect<ScheduledTaskMutationResult, ScheduledTaskError>;
+    readonly listWebhookDeliveries: (
+      input: ScheduledTaskListWebhookDeliveriesInput,
+    ) => Effect.Effect<ScheduledTaskListWebhookDeliveriesResult, ScheduledTaskError>;
+    readonly getWebhookDelivery: (
+      input: ScheduledTaskGetWebhookDeliveryInput,
+    ) => Effect.Effect<ScheduledTaskGetWebhookDeliveryResult, ScheduledTaskError>;
+    /**
+     * Verifies, logs and dispatches one webhook request. Returns as soon as the
+     * delivery and pending dispatch are committed; the run continues in the background so senders
+     * with short timeouts get their answer immediately.
+     */
+    readonly triggerWebhook: (
+      request: WebhookTriggerRequest,
+    ) => Effect.Effect<WebhookTriggerResult, ScheduledTaskError>;
   }
 >()("t3/scheduledTasks/ScheduledTaskService") {}
 
@@ -125,9 +294,31 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-const decodeRow = (row: ScheduledTaskRow) =>
+function webhookPath(taskId: string, token: string): string {
+  return `${WEBHOOK_ROUTE_PREFIX}/${encodeURIComponent(taskId)}/${token}`;
+}
+
+function webhookEndpoint(
+  row: Pick<ScheduledTaskRow, "task_id" | "webhook_token" | "webhook_secret">,
+  origin: WebhookOrigin | null,
+): ScheduledTask["webhook"] {
+  if (row.webhook_token === null) return undefined;
+  const base = origin?.relayHookBaseUrl ?? null;
+  return {
+    path: webhookPath(row.task_id, row.webhook_token),
+    url: base === null ? null : `${base}/${encodeURIComponent(row.task_id)}/${row.webhook_token}`,
+    hasSecret: row.webhook_secret !== null,
+  };
+}
+
+const decodeRow = (row: ScheduledTaskRow, origin: WebhookOrigin | null = null) =>
   Effect.gen(function* () {
     const schedule = yield* decodeScheduleJson(row.schedule_json);
+    const endpoint = schedule.type === "webhook" ? webhookEndpoint(row, origin) : undefined;
+    const webhook =
+      endpoint?.url && origin?.signWebhookUrl
+        ? { ...endpoint, url: yield* origin.signWebhookUrl(endpoint.url) }
+        : endpoint;
     const workspaceStrategy = yield* decodeWorkspaceStrategyJson(row.workspace_strategy_json);
     const modelSelection = yield* decodeModelSelectionJson(row.model_selection_json);
     return yield* decodeTask({
@@ -153,6 +344,7 @@ const decodeRow = (row: ScheduledTaskRow) =>
       lastRunStatus: row.last_run_status,
       lastRunError: row.last_run_error,
       runCount: row.run_count,
+      ...(webhook === undefined ? {} : { webhook }),
     });
   }).pipe(
     Effect.mapError((cause) => {
@@ -209,7 +401,17 @@ export const layer = Layer.effect(
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const secretRequests = yield* SecretRequests.SecretRequests;
     const scheduler = yield* Scheduler.Scheduler;
+    const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
+    // Webhook deliveries for one task dispatch in arrival order rather than
+    // being dropped while an earlier delivery is still dispatching.
+    const webhookPermits = yield* Ref.make<ReadonlyMap<ScheduledTaskId, Semaphore.Semaphore>>(
+      new Map(),
+    );
+    // In-flight workers are tracked separately from the durable pending rows.
+    const webhookDispatching = yield* Ref.make<ReadonlySet<string>>(new Set());
+    const webhookRateWindows = yield* Ref.make<ReadonlyMap<ScheduledTaskId, RateWindow>>(new Map());
     const activeRuns = yield* Ref.make<ReadonlySet<ScheduledTaskId>>(new Set());
     // Sliding(1) coalesces the dirty-signal: every notification triggers a
     // full list() re-emit anyway, so a slow subscriber only ever needs the
@@ -238,7 +440,9 @@ export const layer = Layer.effect(
         last_run_at,
         last_run_status,
         last_run_error,
-        run_count
+        run_count,
+        webhook_token,
+        webhook_secret
       FROM scheduled_tasks
       ORDER BY updated_at DESC, task_id ASC
     `;
@@ -246,7 +450,8 @@ export const layer = Layer.effect(
     // Strict decode for the API surface: a corrupt row is a visible error.
     const listRows = Effect.fn("ScheduledTaskService.listRows")(function* () {
       const rows = yield* selectAllRows();
-      return yield* Effect.forEach(rows, decodeRow, { concurrency: 1 });
+      const origin = yield* readWebhookOrigin;
+      return yield* Effect.forEach(rows, (row) => decodeRow(row, origin), { concurrency: 1 });
     });
 
     const getRows = (id: ScheduledTaskId) => sql<ScheduledTaskRow>`
@@ -270,7 +475,9 @@ export const layer = Layer.effect(
         last_run_at,
         last_run_status,
         last_run_error,
-        run_count
+        run_count,
+        webhook_token,
+        webhook_secret
       FROM scheduled_tasks
       WHERE task_id = ${id}
     `;
@@ -284,8 +491,25 @@ export const layer = Layer.effect(
       );
       const row = rows[0];
       if (row === undefined) return null;
-      return yield* decodeRow(row);
+      return yield* decodeRow(row, yield* readWebhookOrigin);
     });
+
+    const findWebhookCredentials = (id: ScheduledTaskId) =>
+      getRows(id).pipe(
+        Effect.map((rows) =>
+          rows[0] === undefined
+            ? null
+            : { token: rows[0].webhook_token, secret: rows[0].webhook_secret },
+        ),
+        Effect.mapError((cause) =>
+          taskError("Could not load schedule task.", { taskId: id, cause }),
+        ),
+      );
+
+    const newWebhookToken = crypto.randomBytes(32).pipe(
+      Effect.map((bytes) => Buffer.from(bytes).toString("base64url")),
+      Effect.mapError((cause) => taskError("Could not generate webhook token.", { cause })),
+    );
 
     const loadTask = Effect.fn("ScheduledTaskService.loadTask")(function* (id: ScheduledTaskId) {
       const task = yield* findTask(id);
@@ -300,7 +524,16 @@ export const layer = Layer.effect(
     // concurrent settings save must not overwrite an in-flight increment.
     // Check existence in the write itself so an edit cannot undo a deletion
     // that landed after upsert loaded the previous task.
-    const saveTask = (task: ScheduledTask, requireExisting: boolean) =>
+    const saveTask = (
+      task: ScheduledTask,
+      requireExisting: boolean,
+      webhook: {
+        readonly token: string | null;
+        readonly secret: string | null;
+        /** False when the save carried no new secret, so a concurrent change survives. */
+        readonly secretChanged: boolean;
+      },
+    ) =>
       sql<{ task_id: string }>`
         INSERT INTO scheduled_tasks (
           task_id,
@@ -322,7 +555,9 @@ export const layer = Layer.effect(
           last_run_at,
           last_run_status,
           last_run_error,
-          run_count
+          run_count,
+          webhook_token,
+          webhook_secret
         )
         SELECT
           ${task.id},
@@ -344,7 +579,9 @@ export const layer = Layer.effect(
           ${task.lastRunAt},
           ${task.lastRunStatus},
           ${task.lastRunError},
-          ${task.runCount}
+          ${task.runCount},
+          ${webhook.token},
+          ${webhook.secret}
         WHERE ${requireExisting ? 0 : 1} = 1
            OR EXISTS (SELECT 1 FROM scheduled_tasks WHERE task_id = ${task.id})
         ON CONFLICT (task_id)
@@ -361,7 +598,17 @@ export const layer = Layer.effect(
           interaction_mode = excluded.interaction_mode,
           creation_source = excluded.creation_source,
           updated_at = excluded.updated_at,
-          next_run_at = excluded.next_run_at
+          next_run_at = excluded.next_run_at,
+          -- Only rotate changes a live token, so a save racing a rotation
+          -- cannot bring the old URL back.
+          webhook_token = CASE
+            WHEN excluded.webhook_token IS NULL THEN NULL
+            ELSE COALESCE(scheduled_tasks.webhook_token, excluded.webhook_token)
+          END,
+          webhook_secret = CASE
+            WHEN ${webhook.secretChanged ? 1 : 0} = 1 THEN excluded.webhook_secret
+            ELSE scheduled_tasks.webhook_secret
+          END
         RETURNING task_id
       `.pipe(
         Effect.mapError((cause) =>
@@ -375,26 +622,37 @@ export const layer = Layer.effect(
       );
 
     const deleteRow = (id: ScheduledTaskId) =>
-      sql`DELETE FROM scheduled_tasks WHERE task_id = ${id}`.pipe(
-        Effect.mapError((cause) =>
-          taskError("Could not delete schedule task.", { taskId: id, cause }),
-        ),
-      );
+      sql
+        .withTransaction(
+          sql`DELETE FROM scheduled_task_webhook_deliveries WHERE task_id = ${id}`.pipe(
+            Effect.andThen(sql`DELETE FROM scheduled_tasks WHERE task_id = ${id}`),
+          ),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not delete schedule task.", { taskId: id, cause }),
+          ),
+        );
 
     // Run-state transitions use targeted UPDATEs (never the full-row upsert) so
     // a completing run cannot resurrect a deleted task or clobber concurrent
     // edits to the task definition.
     const markRunning = (id: ScheduledTaskId, startedAtIso: string) =>
-      sql`
+      sql<{ task_id: string }>`
         UPDATE scheduled_tasks
         SET updated_at = ${startedAtIso},
             last_run_at = ${startedAtIso},
             last_run_status = 'running',
             last_run_error = NULL
         WHERE task_id = ${id}
+        RETURNING task_id
       `.pipe(
         Effect.mapError((cause) =>
           taskError("Could not mark schedule task as running.", { taskId: id, cause }),
+        ),
+        // A task deleted after the re-read must not be dispatched from the stale snapshot.
+        Effect.flatMap((rows) =>
+          rows.length > 0 ? Effect.void : taskError("Schedule task not found.", { taskId: id }),
         ),
       );
 
@@ -405,6 +663,7 @@ export const layer = Layer.effect(
       readonly status: "succeeded" | "failed";
       readonly error: string | null;
       readonly startedAtIso: string;
+      readonly count?: number;
     }) =>
       sql`
         UPDATE scheduled_tasks
@@ -412,7 +671,7 @@ export const layer = Layer.effect(
             next_run_at = ${input.nextRunAtIso},
             last_run_status = ${input.status},
             last_run_error = ${input.error},
-            run_count = run_count + 1
+            run_count = run_count + ${input.count ?? 1}
         WHERE task_id = ${input.id}
           AND last_run_status = 'running'
           AND last_run_at = ${input.startedAtIso}
@@ -427,7 +686,7 @@ export const layer = Layer.effect(
     // the task forever (it filters out 'running' rows) nor re-fires it
     // immediately: the dispatch may already have gone out, so next_run_at must
     // advance and run_count must count the attempt.
-    const releaseStuckRun = (task: ScheduledTask, message: string) =>
+    const releaseStuckRun = (task: ScheduledTask, message: string, webhook = false) =>
       Effect.gen(function* () {
         const now = yield* localNow;
         // Compute the next occurrence from the current row so a schedule
@@ -442,7 +701,7 @@ export const layer = Layer.effect(
               last_run_error = ${message},
               next_run_at = ${nextRunAt(source, now)},
               updated_at = ${iso(now)},
-              run_count = run_count + 1
+              run_count = run_count + ${webhook ? 0 : 1}
           WHERE task_id = ${task.id} AND last_run_status = 'running'
         `;
         yield* notifyChanged;
@@ -457,7 +716,8 @@ export const layer = Layer.effect(
 
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
-      trigger: "scheduled" | "manual",
+      trigger: "scheduled" | "manual" | "webhook",
+      webhook?: { readonly deliveryId: string; readonly prompt: string },
     ) {
       const reserved = yield* Ref.modify(activeRuns, (active) => {
         if (active.has(task.id)) return [false, active] as const;
@@ -466,7 +726,7 @@ export const layer = Layer.effect(
         return [true, next] as const;
       });
       if (!reserved) {
-        if (trigger === "manual") {
+        if (trigger !== "scheduled") {
           return yield* taskError("Schedule task is already running.", { taskId: task.id });
         }
         return task;
@@ -481,9 +741,14 @@ export const layer = Layer.effect(
         // the poll loaded it — none of those may fire.
         const active = yield* findTask(task.id);
         if (active === null) {
+          if (webhook !== undefined) {
+            return yield* new WebhookDeliverySkipped({
+              reason: "The task was deleted before this delivery ran.",
+            });
+          }
           // A manual run on a just-deleted task must fail loudly, not report
           // a successful run that never dispatched.
-          if (trigger === "manual") {
+          if (trigger !== "scheduled") {
             return yield* taskError("Schedule task not found.", { taskId: task.id });
           }
           return task;
@@ -500,16 +765,36 @@ export const layer = Layer.effect(
         ) {
           return active;
         }
+        // A queued delivery must not run a task that was paused, deleted and
+        // recreated under the same id, or switched to another trigger while
+        // it waited for its turn.
+        if (webhook !== undefined) {
+          const reason =
+            active.createdAt !== task.createdAt
+              ? "The task was replaced before this delivery ran."
+              : active.schedule.type !== "webhook"
+                ? "The task's trigger changed before this delivery ran."
+                : !active.enabled
+                  ? "The task was paused before this delivery ran."
+                  : null;
+          if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
+        }
 
         yield* markRunning(active.id, startedAtIso);
         yield* notifyChanged;
 
-        const fireKey = `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`;
+        // A webhook run is keyed by its delivery so the same delivery can
+        // never dispatch twice.
+        const fireKey =
+          webhook === undefined
+            ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
+            : `${active.id}:webhook:${webhook.deliveryId}`;
         const commandId = CommandId.make(`scheduled-task:${fireKey}`);
         const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
         // Dispatch from the fresh row so prompt/model/binding edits made
-        // after the poll read are honoured.
-        const prompt = active.prompt;
+        // after the poll read are honoured. A webhook prompt was rendered
+        // from the row when the request arrived.
+        const prompt = webhook?.prompt ?? active.prompt;
 
         // Effect.exit (not Effect.result) so defects and interruptions in the
         // dispatch are also captured and recorded as a failed run instead of
@@ -573,19 +858,39 @@ export const layer = Layer.effect(
           // startedAtIso in the guard ensures this writes only to the row this
           // run marked as running — a task deleted mid-run and recreated with
           // the same id (idempotent commandId replay) must not be stamped.
-          yield* markCompleted({
-            id: task.id,
-            completedAtIso: completed.updatedAt,
-            nextRunAtIso: completed.nextRunAt,
-            status: lastRunStatus,
-            error: lastRunError,
-            startedAtIso,
-          });
-          yield* notifyChanged;
+          // Count each webhook delivery once. Completion and pending-row
+          // deletion commit together, including recovery after a command committed.
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const counted =
+                webhook === undefined
+                  ? undefined
+                  : yield* sql`
+              UPDATE scheduled_task_webhook_dispatches SET run_counted = 1
+              WHERE delivery_id = ${webhook.deliveryId} AND run_counted = 0
+              RETURNING delivery_id`;
+              yield* markCompleted({
+                id: task.id,
+                completedAtIso: completed.updatedAt,
+                nextRunAtIso: completed.nextRunAt,
+                status: lastRunStatus,
+                error: lastRunError,
+                startedAtIso,
+                count: counted === undefined ? 1 : counted.length,
+              });
+              if (webhook !== undefined && runSucceeded) {
+                yield* sql`DELETE FROM scheduled_task_webhook_dispatches
+                WHERE delivery_id = ${webhook.deliveryId}`;
+              }
+            }),
+          );
+          if (webhook === undefined) yield* notifyChanged;
         }
         return completed;
       }).pipe(
-        Effect.onError((cause) => releaseStuckRun(task, errorMessage(cause))),
+        Effect.onError((cause) =>
+          releaseStuckRun(task, errorMessage(cause), webhook !== undefined),
+        ),
         Effect.ensuring(
           Ref.update(activeRuns, (active) => {
             const next = new Set(active);
@@ -632,9 +937,10 @@ export const layer = Layer.effect(
       yield* Effect.forEach(
         due,
         ({ task, dueAt }) =>
-          (isMissedFixedTimeRun(task.schedule, dueAt, now)
-            ? rescheduleMissedRun(task, now)
-            : runTask(task, "scheduled")
+          Effect.suspend(() =>
+            isMissedFixedTimeRun(task.schedule, dueAt, now)
+              ? rescheduleMissedRun(task, now)
+              : runTask(task, "scheduled"),
           ).pipe(
             Effect.catch((cause) =>
               Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
@@ -668,7 +974,10 @@ export const layer = Layer.effect(
                     last_run_error = 'Run was interrupted by a server restart.',
                     next_run_at = ${nextRunAt(decoded.success, now)},
                     updated_at = ${iso(now)},
-                    run_count = run_count + 1
+                    run_count = run_count + CASE WHEN EXISTS (
+                      SELECT 1 FROM scheduled_task_webhook_dispatches
+                      WHERE task_id = ${row.task_id} AND task_created_at = ${row.created_at}
+                    ) THEN 0 ELSE 1 END
                 WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
               `;
               return;
@@ -685,7 +994,10 @@ export const layer = Layer.effect(
               SET last_run_status = 'failed',
                   last_run_error = 'Run was interrupted by a server restart.',
                   updated_at = ${iso(now)},
-                  run_count = run_count + 1
+                  run_count = run_count + CASE WHEN EXISTS (
+                    SELECT 1 FROM scheduled_task_webhook_dispatches
+                    WHERE task_id = ${row.task_id} AND task_created_at = ${row.created_at}
+                  ) THEN 0 ELSE 1 END
               WHERE task_id IS ${row.task_id} AND last_run_status = 'running'
             `;
           }),
@@ -742,16 +1054,58 @@ export const layer = Layer.effect(
         // Keep the existing next_run_at when the schedule itself is untouched:
         // editing a title or prompt must not postpone (or resurrect) a due
         // run — only schedule/enabled changes restart the clock.
+        const schedule: ScheduledTask["schedule"] =
+          input.schedule.type === "webhook"
+            ? {
+                type: "webhook",
+                signature:
+                  input.schedule.signature == null
+                    ? null
+                    : {
+                        header: input.schedule.signature.header.toLowerCase(),
+                        encoding: input.schedule.signature.encoding,
+                        prefix: input.schedule.signature.prefix,
+                      },
+                maxDeliveryAgeMinutes: input.schedule.maxDeliveryAgeMinutes ?? null,
+              }
+            : input.schedule;
+        const webhook =
+          input.schedule.type === "webhook"
+            ? yield* Effect.gen(function* () {
+                const existing = existingTask === null ? null : yield* findWebhookCredentials(id);
+                // Saving a webhook task keeps its URL; only rotate changes it.
+                const token = existing?.token ?? (yield* newWebhookToken);
+                const signature =
+                  input.schedule.type === "webhook" ? input.schedule.signature : null;
+                // A secretRef is a value the user entered for an agent; this
+                // save consumes it, so it cannot be used again. A replay of a
+                // save that already used it keeps the secret that save stored.
+                // The ref is resolved inside the save transaction below.
+                const fromRef = undefined;
+                // A ref, when given, is the only source: a plain secret sent
+                // alongside it must not replace what a replayed save stored.
+                const provided = signature?.secretRef === undefined ? signature?.secret : fromRef;
+                const secret = signature == null ? null : (provided ?? existing?.secret ?? null);
+                const secretChanged =
+                  signature == null || provided !== undefined || existing === null;
+                if (signature != null && secret === null && signature.secretRef === undefined) {
+                  return yield* taskError("A webhook signature check needs a signing secret.", {
+                    taskId: id,
+                  });
+                }
+                return { token, secret, secretChanged };
+              })
+            : { token: null, secret: null, secretChanged: true };
         const scheduleUnchanged =
           existingTask !== null &&
           existingTask.enabled === input.enabled &&
-          isSameSchedule(existingTask.schedule, input.schedule);
+          isSameSchedule(existingTask.schedule, schedule);
         const task: ScheduledTask = {
           id,
           title: input.title,
           prompt: input.prompt,
           enabled: input.enabled,
-          schedule: input.schedule,
+          schedule,
           projectId: input.projectId,
           threadId: input.threadId ?? null,
           workspaceStrategy: input.workspaceStrategy,
@@ -764,15 +1118,60 @@ export const layer = Layer.effect(
           updatedAt: iso(now),
           nextRunAt: scheduleUnchanged
             ? existingTask.nextRunAt
-            : nextRunAt({ enabled: input.enabled, schedule: input.schedule }, now),
+            : nextRunAt({ enabled: input.enabled, schedule }, now),
           lastRunAt: existingTask?.lastRunAt ?? null,
           lastRunStatus: existingTask?.lastRunStatus ?? "never",
           lastRunError: existingTask?.lastRunError ?? null,
           runCount: existingTask?.runCount ?? 0,
         };
-        yield* saveTask(task, input.requireExisting === true);
+        const secretRef =
+          input.schedule.type === "webhook" ? input.schedule.signature?.secretRef : undefined;
+        const consumerId =
+          input.commandId === undefined
+            ? undefined
+            : `scheduled-task-save:${id}:${input.commandId}`;
+        if (secretRef === undefined) {
+          yield* saveTask(task, input.requireExisting === true, webhook);
+        } else {
+          yield* secretRequests
+            .consumeWith(
+              {
+                ref: secretRef,
+                projectId: input.projectId,
+                ...(consumerId === undefined ? {} : { consumerId }),
+              },
+              (secret) =>
+                saveTask(task, input.requireExisting === true, {
+                  ...webhook,
+                  secret,
+                  secretChanged: true,
+                }),
+            )
+            .pipe(
+              Effect.catchTag("SecretRequestError", (error) =>
+                Effect.gen(function* () {
+                  // Only replay the exact save that committed this ref. Another edit
+                  // must not silently reuse the task's old signing secret.
+                  const replay =
+                    consumerId === undefined
+                      ? []
+                      : yield* sql`
+              SELECT secret_ref FROM consumed_secret_request_refs
+              WHERE secret_ref = ${secretRef} AND consumer_id = ${consumerId}`.pipe(
+                          Effect.mapError((cause) =>
+                            taskError("Could not verify secret-ref replay.", { taskId: id, cause }),
+                          ),
+                        );
+                  if (replay.length === 0) return yield* taskError(error.message, { taskId: id });
+                  // The command already committed. Return the current row without
+                  // overwriting later edits or recreating a task another device deleted.
+                  yield* loadTask(id);
+                }),
+              ),
+            );
+        }
         yield* notifyChanged;
-        return { task };
+        return { task: yield* loadTask(id) };
       });
 
     const setEnabled: ScheduledTaskService["Service"]["setEnabled"] = (input) =>
@@ -805,17 +1204,612 @@ export const layer = Layer.effect(
       });
 
     const deleteTask: ScheduledTaskService["Service"]["delete"] = (input) =>
-      deleteRow(input.id).pipe(Effect.andThen(notifyChanged), Effect.as({ id: input.id }));
+      deleteRow(input.id).pipe(
+        Effect.andThen(
+          Effect.all([
+            Ref.update(webhookRateWindows, (windows) => {
+              const next = new Map(windows);
+              next.delete(input.id);
+              return next;
+            }),
+            Ref.update(webhookPermits, (permits) => {
+              const next = new Map(permits);
+              next.delete(input.id);
+              return next;
+            }),
+          ]),
+        ),
+        Effect.andThen(notifyChanged),
+        Effect.as({ id: input.id }),
+      );
 
     const runNow: ScheduledTaskService["Service"]["runNow"] = (input: ScheduledTaskRunNowInput) =>
       Effect.gen(function* () {
         const task = yield* loadTask(input.id);
+        if (task.schedule.type === "webhook") {
+          // There is no request to render the prompt from.
+          return yield* taskError("Webhook tasks run when their URL receives a request.", {
+            taskId: input.id,
+          });
+        }
         const next = yield* runTask(task, "manual").pipe(
           Effect.mapError((cause) =>
             taskError("Could not run schedule task.", { taskId: input.id, cause }),
           ),
         );
         return { task: next };
+      });
+
+    const rotateWebhookToken: ScheduledTaskService["Service"]["rotateWebhookToken"] = (input) =>
+      Effect.gen(function* () {
+        const task = yield* loadTask(input.id);
+        if (task.schedule.type !== "webhook") {
+          return yield* taskError("Only webhook tasks have a URL token.", { taskId: input.id });
+        }
+        const token = yield* newWebhookToken;
+        const now = yield* localNow;
+        // Matching created_at keeps a rotation from landing on a task deleted
+        // and recreated under the same id since it was loaded.
+        const updated = yield* sql<{ task_id: string }>`
+          UPDATE scheduled_tasks
+          SET webhook_token = ${token}, updated_at = ${iso(now)}
+          WHERE task_id = ${input.id} AND created_at = ${task.createdAt}
+          RETURNING task_id
+        `.pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not rotate webhook token.", { taskId: input.id, cause }),
+          ),
+        );
+        if (updated.length === 0) {
+          return yield* taskError("Schedule task was deleted or replaced.", { taskId: input.id });
+        }
+        yield* notifyChanged;
+        return { task: yield* loadTask(input.id) };
+      });
+
+    const deliveryHeaders = (row: WebhookDeliveryRow): Readonly<Record<string, string>> =>
+      Option.getOrElse(decodeHeadersJson(row.headers_json), () => ({}));
+    const decodeDeliverySummary = (row: WebhookDeliveryRow) => ({
+      id: ScheduledTaskWebhookDeliveryId.make(row.delivery_id),
+      taskId: ScheduledTaskId.make(row.task_id),
+      receivedAt: row.received_at,
+      method: row.method,
+      contentType: deliveryHeaders(row)["content-type"] ?? null,
+      bodyBytes: row.body_bytes,
+      outcome: row.outcome as ScheduledTaskWebhookDeliveryOutcome,
+      signatureVerified: row.signature_verified === 1,
+      missingFields: Option.getOrElse(decodeMissingFieldsJson(row.missing_fields_json), () => []),
+      error: row.error,
+    });
+
+    const listWebhookDeliveries: ScheduledTaskService["Service"]["listWebhookDeliveries"] = (
+      input,
+    ) =>
+      sql<WebhookDeliveryRow>`
+        SELECT * FROM scheduled_task_webhook_deliveries
+        WHERE task_id = ${input.id}
+        ORDER BY received_at DESC, rowid DESC
+      `.pipe(
+        Effect.map((rows) => ({ deliveries: rows.map(decodeDeliverySummary) })),
+        Effect.mapError((cause) =>
+          taskError("Could not list webhook deliveries.", { taskId: input.id, cause }),
+        ),
+      );
+
+    const getWebhookDelivery: ScheduledTaskService["Service"]["getWebhookDelivery"] = (input) =>
+      Effect.gen(function* () {
+        const rows = yield* sql<WebhookDeliveryRow>`
+          SELECT * FROM scheduled_task_webhook_deliveries
+          WHERE task_id = ${input.id} AND delivery_id = ${input.deliveryId}
+        `.pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not load webhook delivery.", { taskId: input.id, cause }),
+          ),
+        );
+        const row = rows[0];
+        if (row === undefined) {
+          return yield* taskError("Webhook delivery not found.", { taskId: input.id });
+        }
+        return {
+          delivery: {
+            ...decodeDeliverySummary(row),
+            query: row.query,
+            headers: deliveryHeaders(row),
+            body: row.body,
+            bodyTruncated: row.body_truncated === 1,
+            renderedPrompt: row.rendered_prompt,
+          },
+        };
+      });
+
+    const recordDelivery = (input: {
+      readonly id: string;
+      readonly taskId: ScheduledTaskId;
+      readonly receivedAt: string;
+      readonly request: WebhookTriggerRequest;
+      readonly outcome: ScheduledTaskWebhookDeliveryOutcome;
+      readonly signatureVerified: boolean;
+      readonly missing: ReadonlyArray<string>;
+      readonly renderedPrompt: string | null;
+      readonly error?: string;
+    }) => {
+      const truncated = input.request.body.byteLength > WEBHOOK_DELIVERY_LOG_BODY_LIMIT;
+      const loggedBody = truncated
+        ? new TextDecoder().decode(input.request.body.subarray(0, WEBHOOK_DELIVERY_LOG_BODY_LIMIT))
+        : input.request.bodyText;
+      return sql
+        .withTransaction(
+          Effect.gen(function* () {
+            // Conditional on the task existing, so a delivery racing a delete
+            // cannot leave rows that a recreated task with the same id would show.
+            yield* sql`
+              INSERT INTO scheduled_task_webhook_deliveries (
+                delivery_id, task_id, received_at, method, query, headers_json, body,
+                body_bytes, body_truncated, outcome, signature_verified,
+                missing_fields_json, rendered_prompt, error
+              )
+              SELECT
+                ${input.id}, ${input.taskId}, ${input.receivedAt}, ${input.request.method},
+                ${redactQuery(input.request.query)},
+                ${encodeHeadersJson(redactHeaders(input.request.headers))},
+                ${loggedBody},
+                ${input.request.body.byteLength}, ${truncated ? 1 : 0}, ${input.outcome},
+                ${input.signatureVerified ? 1 : 0}, ${encodeMissingFieldsJson(input.missing)},
+                ${input.renderedPrompt?.slice(0, WEBHOOK_DELIVERY_LOG_PROMPT_LIMIT) ?? null},
+                ${input.error ?? null}
+              WHERE EXISTS (SELECT 1 FROM scheduled_tasks WHERE task_id = ${input.taskId})
+              -- A held request retried after a rate limit reuses its relay
+              -- delivery id; the newer attempt replaces the logged one.
+              ON CONFLICT (delivery_id) DO UPDATE SET
+                outcome = excluded.outcome,
+                signature_verified = excluded.signature_verified,
+                missing_fields_json = excluded.missing_fields_json,
+                rendered_prompt = excluded.rendered_prompt,
+                error = excluded.error
+            `;
+            yield* sql`
+            DELETE FROM scheduled_task_webhook_deliveries
+            WHERE task_id = ${input.taskId}
+              AND delivery_id NOT IN (
+                SELECT delivery_id FROM scheduled_task_webhook_deliveries
+                WHERE task_id = ${input.taskId}
+                -- rowid breaks timestamp ties in arrival order; delivery ids are random.
+                ORDER BY received_at DESC, rowid DESC
+                LIMIT ${WEBHOOK_DELIVERY_RETENTION}
+              )
+          `;
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not record webhook delivery.", { taskId: input.taskId, cause }),
+          ),
+        );
+    };
+
+    const markDeliveryFailed = (deliveryId: string, message: string) =>
+      sql`
+        UPDATE scheduled_task_webhook_deliveries
+        SET outcome = 'dispatch_failed', error = ${message}
+        WHERE delivery_id = ${deliveryId}
+      `.pipe(Effect.ignore);
+
+    /**
+     * Sliding one-minute window counting every request with a valid token,
+     * including ones the signature check later rejects.
+     */
+    const takeRateSlot = (id: ScheduledTaskId, nowMs: number) =>
+      Ref.modify(
+        webhookRateWindows,
+        (
+          windows,
+        ): readonly [
+          "allowed" | "first_rejected" | "rejected",
+          ReadonlyMap<ScheduledTaskId, RateWindow>,
+        ] => {
+          const current = windows.get(id);
+          const recent = (current?.accepted ?? []).filter((at) => nowMs - at < 60_000);
+          if (recent.length >= WEBHOOK_RATE_LIMIT_PER_MINUTE) {
+            const first = current?.rejectedLogged !== true;
+            return [
+              first ? "first_rejected" : "rejected",
+              new Map(windows).set(id, { accepted: recent, rejectedLogged: true }),
+            ];
+          }
+          return [
+            "allowed",
+            new Map(windows).set(id, { accepted: [...recent, nowMs], rejectedLogged: false }),
+          ];
+        },
+      );
+
+    const webhookPermit = (id: ScheduledTaskId) =>
+      Effect.gen(function* () {
+        const existing = (yield* Ref.get(webhookPermits)).get(id);
+        if (existing !== undefined) return existing;
+        const created = yield* Semaphore.make(1);
+        return yield* Ref.modify(webhookPermits, (permits) => {
+          const raced = permits.get(id);
+          return raced === undefined
+            ? [created, new Map(permits).set(id, created)]
+            : [raced, permits];
+        });
+      });
+
+    // Detached from the request so the HTTP response does not wait for the
+    // run; scoped to the service so shutdown interrupts it.
+    const serviceScope = yield* Effect.scope;
+
+    interface PendingWebhookDispatch {
+      readonly delivery_id: string;
+      readonly task_id: string;
+      readonly task_created_at: string;
+      readonly prompt: string;
+    }
+
+    // Pending rows survive service shutdown. The delivery-derived command id
+    // makes recovery safe if the process died after dispatch but before cleanup.
+    const startWebhookDispatch = Effect.fn("ScheduledTaskService.startWebhookDispatch")(function* (
+      pending: PendingWebhookDispatch,
+    ) {
+      const reserved = yield* Ref.modify(webhookDispatching, (active) =>
+        active.has(pending.delivery_id)
+          ? ([false, active] as const)
+          : ([true, new Set(active).add(pending.delivery_id)] as const),
+      );
+      if (!reserved) return;
+      const release = Ref.update(webhookDispatching, (active) => {
+        const next = new Set(active);
+        next.delete(pending.delivery_id);
+        return next;
+      });
+      const permit = yield* webhookPermit(ScheduledTaskId.make(pending.task_id));
+      const removePending = sql`DELETE FROM scheduled_task_webhook_dispatches
+          WHERE delivery_id = ${pending.delivery_id}`;
+      const retryOrFinish = (message: string) =>
+        sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const attempts = yield* sql<{ attempts: number }>`
+          UPDATE scheduled_task_webhook_dispatches SET attempts = attempts + 1
+          WHERE delivery_id = ${pending.delivery_id} RETURNING attempts`;
+              const exhausted =
+                (attempts[0]?.attempts ?? WEBHOOK_MAX_DISPATCH_ATTEMPTS) >=
+                WEBHOOK_MAX_DISPATCH_ATTEMPTS;
+              yield* markDeliveryFailed(
+                pending.delivery_id,
+                exhausted
+                  ? `${message} Dispatch stopped after ${WEBHOOK_MAX_DISPATCH_ATTEMPTS} failed attempts.`
+                  : `${message} Dispatch will retry.`,
+              );
+              if (exhausted) yield* removePending;
+            }),
+          )
+          .pipe(Effect.andThen(notifyChanged));
+      yield* Effect.gen(function* () {
+        const current = yield* findTask(ScheduledTaskId.make(pending.task_id));
+        if (current === null) {
+          yield* markDeliveryFailed(
+            pending.delivery_id,
+            "The task was deleted before this delivery ran.",
+          );
+          yield* removePending;
+          return;
+        }
+        const completed = yield* runTask(
+          { ...current, createdAt: pending.task_created_at },
+          "webhook",
+          { deliveryId: pending.delivery_id, prompt: pending.prompt },
+        );
+        if (completed.lastRunStatus === "failed") {
+          // Retain transient failures, but release the bounded queue after repeated
+          // failures. The delivery log keeps the terminal error for the user.
+          yield* retryOrFinish(completed.lastRunError ?? "The run failed to start.");
+          yield* Metrics.increment(Metrics.webhookRunsTotal, { outcome: "failed" });
+          return;
+        }
+        yield* removePending;
+        yield* notifyChanged;
+        yield* Metrics.increment(Metrics.webhookRunsTotal, { outcome: "started" });
+      }).pipe(
+        Effect.catchTag("WebhookDeliverySkipped", (skipped) =>
+          markDeliveryFailed(pending.delivery_id, skipped.reason).pipe(
+            Effect.andThen(removePending),
+            Effect.andThen(Metrics.increment(Metrics.webhookRunsTotal, { outcome: "skipped" })),
+          ),
+        ),
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.void
+            : retryOrFinish(errorMessage(cause)).pipe(
+                Effect.andThen(
+                  Effect.logWarning("Webhook dispatch failed", { taskId: pending.task_id, cause }),
+                ),
+              ),
+        ),
+        permit.withPermits(1),
+        Effect.withSpan("ScheduledTaskService.runWebhookDelivery", {
+          root: true,
+          attributes: {
+            "scheduled_task.id": pending.task_id,
+            "scheduled_task.webhook.delivery_id": pending.delivery_id,
+          },
+        }),
+        Effect.ensuring(release),
+        Effect.interruptible,
+        Effect.forkIn(serviceScope),
+      );
+    }, Effect.uninterruptible);
+    const recoverWebhookDispatches = Effect.gen(function* () {
+      const active = yield* Ref.get(webhookDispatching);
+      const pending = yield* sql<PendingWebhookDispatch>`
+        SELECT delivery_id, task_id, task_created_at, prompt
+        FROM scheduled_task_webhook_dispatches
+        WHERE NOT ${sql.in("delivery_id", Array.from(active))}
+        ORDER BY rowid LIMIT 200`;
+      yield* Effect.forEach(pending, startWebhookDispatch, { discard: true });
+    });
+    yield* scheduler.register("scheduled-task-webhooks", recoverWebhookDispatches);
+
+    /**
+     * Records one handled request on the span and in metrics. `outcome` is
+     * finer than the result tag: it separates a full queue and an oversized
+     * prompt from the rest, which is what an operator needs to act on.
+     */
+    const observeDelivery = (
+      request: WebhookTriggerRequest,
+      outcome: WebhookDeliveryOutcome,
+      receivedAt: DateTime.DateTime | undefined,
+      now: DateTime.DateTime | undefined,
+    ) =>
+      Effect.gen(function* () {
+        const source = request.relayDeliveryId === undefined ? "direct" : "relay";
+        yield* Effect.annotateCurrentSpan({
+          "scheduled_task.webhook.outcome": outcome,
+          "scheduled_task.webhook.source": source,
+        });
+        yield* Metrics.increment(Metrics.webhookDeliveriesTotal, { outcome, source });
+        if (request.receivedAt !== undefined && receivedAt !== undefined && now !== undefined) {
+          const heldMs = Math.max(
+            0,
+            DateTime.toEpochMillis(now) - DateTime.toEpochMillis(receivedAt),
+          );
+          yield* Effect.annotateCurrentSpan({ "scheduled_task.webhook.held_ms": heldMs });
+          yield* Metric.update(Metrics.webhookHeldDelay, Duration.millis(heldMs));
+        }
+      });
+
+    const triggerWebhook: ScheduledTaskService["Service"]["triggerWebhook"] = (request) =>
+      triggerWebhookUnobserved(request).pipe(
+        Effect.tapError(() => observeDelivery(request, "error", undefined, undefined)),
+        Metrics.withMetrics({ timer: Metrics.webhookDeliveryDuration }),
+        Effect.withSpan("ScheduledTaskService.triggerWebhook", {
+          attributes: {
+            "scheduled_task.webhook.method": request.method,
+            "scheduled_task.webhook.body_bytes": request.body.byteLength,
+            "scheduled_task.webhook.source":
+              request.relayDeliveryId === undefined ? "direct" : "relay",
+          },
+        }),
+      );
+
+    const triggerWebhookUnobserved = (request: WebhookTriggerRequest) =>
+      Effect.gen(function* () {
+        const taskId = decodeTaskId(request.hookId);
+        const notFound = observeDelivery(request, "not_found", undefined, undefined).pipe(
+          Effect.as({ _tag: "not_found" as const }),
+        );
+        if (Option.isNone(taskId)) return yield* notFound;
+        const rows = yield* getRows(taskId.value).pipe(
+          Effect.mapError((cause) =>
+            taskError("Could not load schedule task.", { taskId: taskId.value, cause }),
+          ),
+        );
+        const row = rows[0];
+        // A wrong token is indistinguishable from an unknown hook, so the URL
+        // does not reveal which hooks exist.
+        if (
+          row === undefined ||
+          row.webhook_token === null ||
+          !constantTimeEquals(request.token, row.webhook_token)
+        ) {
+          return yield* notFound;
+        }
+        const task = yield* decodeRow(row);
+        yield* Effect.annotateCurrentSpan({ "scheduled_task.id": task.id });
+        const schedule = task.schedule;
+        if (schedule.type !== "webhook") return yield* notFound;
+
+        const now = yield* localNow;
+        // Anyone can reach the tunnel directly and set the relay's header, so
+        // a receive time is never later than now: a future one would pin the
+        // delivery in the log and slip past the task's max age.
+        const receivedAt =
+          request.receivedAt === undefined
+            ? now
+            : DateTime.min(
+                Option.getOrElse(DateTime.make(request.receivedAt), () => now),
+                now,
+              );
+        const observe = (outcome: WebhookDeliveryOutcome) =>
+          observeDelivery(request, outcome, receivedAt, now);
+        const deliveryId = ScheduledTaskWebhookDeliveryId.make(
+          request.relayDeliveryId === undefined
+            ? `delivery:${yield* crypto.randomUUIDv4.pipe(
+                Effect.mapError((cause) => taskError("Could not generate delivery id.", { cause })),
+              )}`
+            : `delivery:relay:${request.relayDeliveryId}`,
+        );
+        // A held request may already have reached this environment directly
+        // before a timeout; it runs once. Claimed in its own table, kept longer
+        // than the relay holds a request, because the delivery log is trimmed.
+        // A rate-limited delivery stays held on the relay, so it must give up
+        // its claim or the next pass would treat it as already delivered.
+        const releaseClaim = <A>(result: A) =>
+          request.relayDeliveryId === undefined
+            ? Effect.succeed(result)
+            : sql`
+                DELETE FROM scheduled_task_webhook_relay_deliveries
+                WHERE relay_delivery_id = ${request.relayDeliveryId}
+              `.pipe(Effect.as(result));
+        // Atomically commit the claim, delivery log and pending dispatch: a
+        // request dropped in between (the relay hangs up after its timeout)
+        // must never acknowledge a claim that has no recoverable dispatch.
+        // Everything in this transaction is local and quick.
+        const result = yield* Effect.uninterruptible(
+          sql
+            .withTransaction(
+              Effect.gen(function* () {
+                if (request.relayDeliveryId !== undefined) {
+                  const claimed = yield* sql<{ relay_delivery_id: string }>`
+                INSERT INTO scheduled_task_webhook_relay_deliveries
+                  (relay_delivery_id, task_id, seen_at)
+                VALUES (${request.relayDeliveryId}, ${task.id}, ${iso(now)})
+                ON CONFLICT (relay_delivery_id) DO NOTHING
+                RETURNING relay_delivery_id
+              `.pipe(
+                    Effect.mapError((cause) =>
+                      taskError("Could not record webhook delivery.", { taskId: task.id, cause }),
+                    ),
+                  );
+                  if (claimed.length === 0) {
+                    // A held request this environment already ran: accepted, not run twice.
+                    yield* observe("duplicate");
+                    return { _tag: "accepted" as const, deliveryId, outcome: "duplicate" as const };
+                  }
+                  // Older claims can no longer be replayed by the relay.
+                  yield* sql`
+                DELETE FROM scheduled_task_webhook_relay_deliveries
+                WHERE seen_at < ${iso(DateTime.subtract(now, { hours: 48 }))}
+              `.pipe(Effect.ignore);
+                }
+                const log = (
+                  outcome: ScheduledTaskWebhookDeliveryOutcome,
+                  details: {
+                    readonly signatureVerified?: boolean;
+                    readonly missing?: ReadonlyArray<string>;
+                    readonly renderedPrompt?: string;
+                    readonly error?: string;
+                  } = {},
+                ) =>
+                  recordDelivery({
+                    id: deliveryId,
+                    taskId: task.id,
+                    receivedAt: iso(receivedAt),
+                    request,
+                    outcome,
+                    signatureVerified: details.signatureVerified ?? false,
+                    missing: details.missing ?? [],
+                    renderedPrompt: details.renderedPrompt ?? null,
+                    ...(details.error === undefined ? {} : { error: details.error }),
+                  });
+
+                // Only the first rejected request in a window is logged, so a flood
+                // cannot write rows or push the real deliveries out of the log.
+                const slot = yield* takeRateSlot(task.id, DateTime.toEpochMillis(now));
+                if (slot !== "allowed") {
+                  if (slot === "first_rejected") yield* log("rate_limited");
+                  yield* observe("rate_limited");
+                  return yield* releaseClaim({
+                    _tag: "rate_limited" as const,
+                    outcome: "rate_limited" as const,
+                  });
+                }
+                if (!task.enabled) {
+                  yield* log("disabled");
+                  yield* observe("disabled");
+                  return { _tag: "disabled" as const };
+                }
+                const signature = schedule.signature;
+                if (signature !== null) {
+                  const verified =
+                    row.webhook_secret !== null &&
+                    verifyWebhookSignature({
+                      signature,
+                      secret: row.webhook_secret,
+                      headers: request.headers,
+                      body: request.body,
+                    });
+                  if (!verified) {
+                    yield* log("rejected_signature");
+                    yield* observe("rejected_signature");
+                    return { _tag: "rejected_signature" as const };
+                  }
+                }
+                const maxAgeMinutes = schedule.maxDeliveryAgeMinutes ?? null;
+                if (
+                  maxAgeMinutes !== null &&
+                  DateTime.toEpochMillis(now) - DateTime.toEpochMillis(receivedAt) >
+                    maxAgeMinutes * 60_000
+                ) {
+                  yield* log("expired", { signatureVerified: signature !== null });
+                  yield* observe("expired");
+                  return { _tag: "expired" as const };
+                }
+
+                const rendered = renderWebhookPrompt(task.prompt, request);
+                // A provider refuses a turn this long, so it is not started. The
+                // delivery is not retryable, so the claim is kept. Providers trim
+                // the prompt before checking, so whitespace around it is free.
+                if (rendered.prompt.trim().length > PROVIDER_SEND_TURN_MAX_INPUT_CHARS) {
+                  yield* log("dispatch_failed", {
+                    signatureVerified: signature !== null,
+                    missing: rendered.missing,
+                    renderedPrompt: rendered.prompt,
+                    error: "The filled-in prompt is too long.",
+                  });
+                  yield* observe("prompt_too_long");
+                  return {
+                    _tag: "accepted" as const,
+                    deliveryId,
+                    outcome: "prompt_too_long" as const,
+                  };
+                }
+                // Bound the deliveries one task holds, so steady traffic to a stuck
+                // task cannot pile up parked fibers. A refused request is not logged,
+                // so it cannot push real deliveries out of the log.
+                const counts = yield* sql<{ count: number }>`
+              SELECT COUNT(*) AS count FROM scheduled_task_webhook_dispatches
+              WHERE task_id = ${task.id} AND task_created_at = ${task.createdAt}`;
+                if ((counts[0]?.count ?? 0) >= WEBHOOK_MAX_QUEUED_PER_TASK) {
+                  yield* observe("queue_full");
+                  return yield* releaseClaim({
+                    _tag: "rate_limited" as const,
+                    outcome: "queue_full" as const,
+                  });
+                }
+                yield* log("accepted", {
+                  signatureVerified: signature !== null,
+                  missing: rendered.missing,
+                  renderedPrompt: rendered.prompt,
+                });
+                yield* sql`INSERT INTO scheduled_task_webhook_dispatches
+              (delivery_id, task_id, task_created_at, prompt)
+              VALUES (${deliveryId}, ${task.id}, ${task.createdAt}, ${rendered.prompt})`;
+                yield* observe("accepted");
+                return { _tag: "accepted" as const, deliveryId, outcome: "accepted" as const };
+              }),
+            )
+            .pipe(
+              Effect.mapError((cause) =>
+                taskError("Could not commit webhook delivery.", { taskId: task.id, cause }),
+              ),
+            ),
+        );
+        if (
+          result._tag === "accepted" &&
+          (result.outcome === "accepted" || result.outcome === "duplicate")
+        ) {
+          const pending = yield* sql<PendingWebhookDispatch>`
+            SELECT delivery_id, task_id, task_created_at, prompt
+            FROM scheduled_task_webhook_dispatches WHERE delivery_id = ${result.deliveryId}`.pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not load pending webhook dispatch.", { taskId: task.id, cause }),
+            ),
+          );
+          if (pending[0]) yield* startWebhookDispatch(pending[0]);
+        }
+        return result;
       });
 
     return ScheduledTaskService.of({
@@ -825,6 +1819,10 @@ export const layer = Layer.effect(
       setEnabled,
       delete: deleteTask,
       runNow,
+      rotateWebhookToken,
+      listWebhookDeliveries,
+      getWebhookDelivery,
+      triggerWebhook,
     });
   }),
 );

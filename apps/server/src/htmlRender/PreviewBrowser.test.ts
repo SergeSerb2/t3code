@@ -77,6 +77,7 @@ const browserArchive = makeZip([
 const makeHarness = Effect.fn("test.makePreviewBrowser")(function* (
   options: {
     readonly archive?: Buffer;
+    readonly baseDir?: string;
     readonly sha256?: string;
     readonly body?: Stream.Stream<Uint8Array>;
     readonly wait?: Duration.Input;
@@ -85,7 +86,8 @@ const makeHarness = Effect.fn("test.makePreviewBrowser")(function* (
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-preview-browser-test-" });
+  const baseDir =
+    options.baseDir ?? (yield* fs.makeTempDirectoryScoped({ prefix: "t3-preview-browser-test-" }));
   const archive = options.archive ?? browserArchive;
   const requests: Array<string> = [];
   const browser = yield* PreviewBrowser.makePreviewBrowser({
@@ -121,6 +123,30 @@ const makeHarness = Effect.fn("test.makePreviewBrowser")(function* (
 });
 
 it.layer(NodeServices.layer)("PreviewBrowser", (it) => {
+  it.effect("a concurrent install preserves the directory published by its peer", () =>
+    Effect.gen(function* () {
+      const downloadStarted = yield* Deferred.make<void>();
+      const finishDownload = yield* Deferred.make<void>();
+      const first = yield* makeHarness();
+      const second = yield* makeHarness({
+        baseDir: first.baseDir,
+        body: Stream.fromEffect(
+          Deferred.succeed(downloadStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(finishDownload)),
+            Effect.as(browserArchive),
+          ),
+        ),
+      });
+      const installing = yield* second.browser.executable.pipe(Effect.forkChild);
+      yield* Deferred.await(downloadStarted);
+      const published = yield* first.browser.executable;
+      const marker = first.path.join(first.installRoot, "1.2.3", "peer-marker");
+      yield* first.fs.writeFileString(marker, "preserved");
+      yield* Deferred.succeed(finishDownload, undefined);
+      expect(yield* Fiber.join(installing)).toBe(published);
+      expect(yield* first.fs.readFileString(marker)).toBe("preserved");
+    }),
+  );
   it.effect("installs a verified download with its file modes and then reuses it", () =>
     Effect.gen(function* () {
       const { browser, fs, path, installRoot, requests } = yield* makeHarness();

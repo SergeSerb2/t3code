@@ -75,6 +75,7 @@ const WEBHOOK_RATE_LIMIT_PER_MINUTE = 60;
  */
 interface WebhookOrigin {
   readonly relayHookBaseUrl: string | null;
+  readonly signWebhookUrl?: (url: string) => Effect.Effect<string>;
 }
 
 const ENDPOINT_KEY = /^[0-9a-f]{16}$/;
@@ -313,7 +314,11 @@ function webhookEndpoint(
 const decodeRow = (row: ScheduledTaskRow, origin: WebhookOrigin | null = null) =>
   Effect.gen(function* () {
     const schedule = yield* decodeScheduleJson(row.schedule_json);
-    const webhook = schedule.type === "webhook" ? webhookEndpoint(row, origin) : undefined;
+    const endpoint = schedule.type === "webhook" ? webhookEndpoint(row, origin) : undefined;
+    const webhook =
+      endpoint?.url && origin?.signWebhookUrl
+        ? { ...endpoint, url: yield* origin.signWebhookUrl(endpoint.url) }
+        : endpoint;
     const workspaceStrategy = yield* decodeWorkspaceStrategyJson(row.workspace_strategy_json);
     const modelSelection = yield* decodeModelSelectionJson(row.model_selection_json);
     return yield* decodeTask({

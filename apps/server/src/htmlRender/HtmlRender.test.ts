@@ -57,6 +57,25 @@ const testLayer = htmlRenderLayer();
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 describe("HtmlRender", () => {
+  it.effect("rejects images outside the authorized workspace, including escaping symlinks", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const service = yield* HtmlRender.HtmlRender;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "html-root-" });
+      const other = yield* fs.makeTempDirectoryScoped({ prefix: "html-outside-" });
+      const outside = path.join(other, "private.png");
+      const alias = path.join(root, "alias.png");
+      yield* fs.writeFile(outside, PNG_BYTES);
+      yield* fs.symlink(outside, alias);
+      for (const candidate of [outside, alias]) {
+        const error = yield* service.prepare(`<img src="${candidate}">`, [root]).pipe(Effect.flip);
+        expect(error).toBeInstanceOf(HtmlRender.HtmlRenderImagesNotFoundError);
+      }
+      const denied = yield* service.prepare(`<img src="${outside}">`).pipe(Effect.flip);
+      expect(denied).toBeInstanceOf(HtmlRender.HtmlRenderImagesNotFoundError);
+    }).pipe(Effect.provide(testLayer)),
+  );
   it.effect("inlines local images by absolute path and leaves URLs and relative paths alone", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -82,6 +101,7 @@ describe("HtmlRender", () => {
           ...kept.map((src) => `<img src="${src}">`),
           "</body></html>",
         ].join(""),
+        [directory],
       );
 
       const pngUri = `data:image/png;base64,${Base64.encode(PNG_BYTES)}`;
@@ -112,7 +132,7 @@ describe("HtmlRender", () => {
       ].join("\n");
       yield* fileSystem.writeFileString(svg, source);
 
-      const prepared = yield* htmlRender.prepare(`<img src="${svg}">`);
+      const prepared = yield* htmlRender.prepare(`<img src="${svg}">`, [directory]);
 
       expect(prepared).toContain(`data:image/svg+xml;base64,${Base64.encode(source)}`);
     }).pipe(Effect.provide(testLayer)),
@@ -151,6 +171,7 @@ describe("HtmlRender", () => {
       const error = yield* htmlRender
         .prepare(
           `<img src="${missing}"><img src='${folder}'><img src="C:\\nope\\shot.webp"><img src="${secret}"><img src="${report}"><img src="${config}"><img src="${stalling}"><img src="${unclosed}"><img src="${upper}"><img src="${longer}">`,
+          [directory],
         )
         .pipe(Effect.flip);
 
@@ -200,16 +221,22 @@ describe("HtmlRender", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("removes the page when publishing is interrupted", () =>
+  it.effect("removes the page and pending marker when publishing is interrupted", () =>
     Effect.gen(function* () {
       const measuring = yield* Deferred.make<void>();
       yield* Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
         const config = yield* ServerConfig.ServerConfig;
         const htmlRender = yield* HtmlRender.HtmlRender;
-        const storedPages = fileSystem
+        const storedArtifacts = fileSystem
           .readDirectory(config.attachmentsDir, { recursive: true })
-          .pipe(Effect.map((names) => names.filter((name) => name.endsWith(".html"))));
+          .pipe(
+            Effect.map((names) =>
+              names.filter(
+                (name) => name.endsWith(".html") || name.endsWith(".pending-html-render"),
+              ),
+            ),
+          );
 
         const publishing = yield* htmlRender
           .publish({
@@ -220,9 +247,9 @@ describe("HtmlRender", () => {
           })
           .pipe(Effect.forkChild);
         yield* Deferred.await(measuring);
-        expect(yield* storedPages).toHaveLength(1);
+        expect(yield* storedArtifacts).toHaveLength(2);
         yield* Fiber.interrupt(publishing);
-        expect(yield* storedPages).toEqual([]);
+        expect(yield* storedArtifacts).toEqual([]);
       }).pipe(
         Effect.provide(
           htmlRenderLayer(

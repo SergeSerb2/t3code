@@ -10,6 +10,7 @@ import {
   ThreadId,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
+import * as Option from "effect/Option";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -207,6 +208,11 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
         Layer.provideMerge(McpServer.McpServer.layer),
         Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-html-render-" })),
         Layer.provide(NodeServices.layer),
+        Layer.provide(
+          Layer.mock(ProjectService.ProjectService)({
+            getById: () => Effect.succeed(Option.none()),
+          }),
+        ),
         // The preview browser is not installed in a fresh home, so nothing downloads.
         Layer.provide(FetchHttpClient.layer),
         Layer.provide(
@@ -215,6 +221,7 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
             getThreadShell: () =>
               Effect.succeed({
                 id: threadId,
+                worktreePath: null,
                 deletedAt: null,
                 archivedAt: null,
                 activeRunId: RunId.make("mcp-core-run"),

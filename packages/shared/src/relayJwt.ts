@@ -1,4 +1,13 @@
-import { decodeJwt, importPKCS8, importSPKI, jwtVerify, SignJWT, type JWTPayload } from "jose";
+import {
+  CompactSign,
+  compactVerify,
+  decodeJwt,
+  importPKCS8,
+  importSPKI,
+  jwtVerify,
+  SignJWT,
+  type JWTPayload,
+} from "jose";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Predicate from "effect/Predicate";
@@ -101,3 +110,55 @@ export function verifyRelayJwt(input: {
       }),
   });
 }
+
+/** URL capability issued by the already-linked environment; no additional credential is provisioned. */
+export const RELAY_HOOK_HOLD_PROOF_PARAM = "t3_hold_proof";
+const RELAY_HOOK_HOLD_TYP = "t3-env-hook-hold";
+const hookHoldBinding = (endpointKey: string, hookId: string, token: string) =>
+  JSON.stringify([endpointKey, hookId, token]);
+
+export const signRelayHookHoldUrl = (
+  url: string,
+  privateKey: string,
+): Effect.Effect<string, RelayJwtError> =>
+  Effect.tryPromise({
+    try: async () => {
+      const parsed = new URL(url);
+      const segments = parsed.pathname.split("/");
+      if (segments.length !== 6 || segments[1] !== "v1" || segments[2] !== "hooks")
+        throw new Error("Invalid hook URL");
+      const binding = hookHoldBinding(
+        segments[3]!,
+        decodeURIComponent(segments[4]!),
+        decodeURIComponent(segments[5]!),
+      );
+      const key = await importPKCS8(normalizePem(privateKey), "EdDSA");
+      const proof = await new CompactSign(new TextEncoder().encode(binding))
+        .setProtectedHeader({ alg: "EdDSA", typ: RELAY_HOOK_HOLD_TYP })
+        .sign(key);
+      parsed.searchParams.set(RELAY_HOOK_HOLD_PROOF_PARAM, proof);
+      return parsed.toString();
+    },
+    catch: (cause) => new RelayJwtError({ operation: "sign", typ: RELAY_HOOK_HOLD_TYP, cause }),
+  });
+
+export const verifyRelayHookHoldProof = (input: {
+  readonly proof: string;
+  readonly publicKey: string;
+  readonly endpointKey: string;
+  readonly hookId: string;
+  readonly token: string;
+}): Effect.Effect<boolean> =>
+  Effect.tryPromise({
+    try: async () => {
+      if (input.proof.length > 4096) return false;
+      const key = await importSPKI(normalizePem(input.publicKey), "EdDSA");
+      const verified = await compactVerify(input.proof, key, { algorithms: ["EdDSA"] });
+      return (
+        verified.protectedHeader.typ === RELAY_HOOK_HOLD_TYP &&
+        new TextDecoder().decode(verified.payload) ===
+          hookHoldBinding(input.endpointKey, input.hookId, input.token)
+      );
+    },
+    catch: () => false,
+  }).pipe(Effect.orElseSucceed(() => false));

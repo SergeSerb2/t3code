@@ -181,7 +181,11 @@ const make = Effect.gen(function* () {
               : Effect.void,
           ),
         );
-      if (input.answer.type !== "save") return;
+      if (input.answer.type !== "save") {
+        // A crash can leave a value stored while its card is still pending.
+        yield* removeLogged(storeName(refFor(salt, input.threadId, item.id)));
+        return;
+      }
       // A request is answered once: if the agent's wait closed the card between
       // the checks above and this record, the record changed nothing. Nobody
       // will receive the ref, so the value is deleted rather than left to expire.

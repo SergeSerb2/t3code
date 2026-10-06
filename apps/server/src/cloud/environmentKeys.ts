@@ -38,7 +38,7 @@ const keyPairEncodeError = (cause: unknown): ServerSecretStore.SecretStoreEncode
 const keyPairConcurrentReadError = (): ServerSecretStore.SecretStoreConcurrentReadError =>
   new ServerSecretStore.SecretStoreConcurrentReadError({ resource: KEY_PAIR_RESOURCE });
 
-const readEnvironmentKeyPair = Effect.fn("readEnvironmentKeyPair")(function* (
+export const readEnvironmentKeyPair = Effect.fn("readEnvironmentKeyPair")(function* (
   secrets: ServerSecretStore.ServerSecretStore["Service"],
 ) {
   const encoded = yield* secrets.get(CLOUD_LINK_KEY_PAIR);

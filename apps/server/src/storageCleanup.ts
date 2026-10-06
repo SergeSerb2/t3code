@@ -26,6 +26,7 @@ import type { PlatformError } from "effect/PlatformError";
 import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 
+import { makeHtmlRenderAttachmentCleanup } from "./htmlRender/HtmlRenderAttachmentCleanup.ts";
 import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
@@ -117,6 +118,7 @@ export const make = Effect.gen(function* () {
   const terminals = yield* TerminalManager.TerminalManager;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const cleanHtmlAttachments = yield* makeHtmlRenderAttachmentCleanup;
   const liveTerminals = new Map<string, Map<string, TerminalSummary>>();
   const noteTerminal = (terminal: TerminalSummary) => {
     const threadTerminals =
@@ -419,6 +421,9 @@ export const make = Effect.gen(function* () {
     const serverSettings = yield* settingsService.getSettings;
     const settings = serverSettings.storageCleanup;
     const now = yield* Clock.currentTimeMillis;
+    yield* cleanHtmlAttachments(config.attachmentsDir, now).pipe(
+      Effect.catch((error) => Effect.logWarning("HTML attachment cleanup failed", { error })),
+    );
     yield* cleanWorktrees(serverSettings, now).pipe(
       Effect.catch((error) => Effect.logWarning("worktree cleanup failed", { error })),
     );

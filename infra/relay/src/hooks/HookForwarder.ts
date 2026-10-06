@@ -20,6 +20,8 @@ import {
   RELAY_HOOK_DELIVERY_HEADER,
   RELAY_HOOK_DELIVERY_TYP,
   signRelayJwt,
+  RELAY_HOOK_HOLD_PROOF_PARAM,
+  verifyRelayHookHoldProof,
 } from "@t3tools/shared/relayJwt";
 
 import * as RelayConfiguration from "../Config.ts";
@@ -298,6 +300,7 @@ export const resolveHookEndpoint = Effect.fn("relay.hooks.resolve_endpoint")(fun
     ...result.success,
     environmentId: allocation.environmentId,
     holdWhileOffline: link.holdWebhooksWhileOffline,
+    environmentPublicKey: link.environmentPublicKey,
   };
 });
 
@@ -405,6 +408,9 @@ const make = Effect.gen(function* () {
       hookId: parsed.hookId,
       jti: yield* crypto.randomUUIDv4.pipe(Effect.orDie),
     });
+    const deliveryQuery = new URLSearchParams(parsed.search);
+    const hasHoldProof = deliveryQuery.has(RELAY_HOOK_HOLD_PROOF_PARAM);
+    deliveryQuery.delete(RELAY_HOOK_HOLD_PROOF_PARAM);
     const hook = {
       id: deliveryId,
       receivedAt,
@@ -412,7 +418,7 @@ const make = Effect.gen(function* () {
       rawHookId: parsed.rawHookId,
       rawToken: parsed.rawToken,
       hookKey: parsed.hookId,
-      query: parsed.search.replace(/^\?/, ""),
+      query: hasHoldProof ? deliveryQuery.toString() : parsed.search.replace(/^\?/, ""),
       headers: { ...forwardedHeaders(request.headers), [RELAY_HOOK_DELIVERY_HEADER]: proof },
       body: body.success,
     };
@@ -422,6 +428,20 @@ const make = Effect.gen(function* () {
         if (!endpoint.holdWhileOffline) {
           yield* outcome(error);
           return errorResponse(status, error);
+        }
+        const proofs = new URLSearchParams(parsed.search).getAll(RELAY_HOOK_HOLD_PROOF_PARAM);
+        const authorized =
+          proofs.length === 1 &&
+          (yield* verifyRelayHookHoldProof({
+            proof: proofs[0]!,
+            publicKey: endpoint.environmentPublicKey,
+            endpointKey: parsed.endpointKey,
+            hookId: parsed.hookId,
+            token: decodeURIComponent(parsed.rawToken),
+          }));
+        if (!authorized) {
+          yield* outcome("invalid_hold_authorization");
+          return errorResponse(401, "invalid_hold_authorization");
         }
         const stored = yield* inbox
           .hold({

@@ -259,6 +259,24 @@ it.effect("a ref only works in the project it was entered for", () =>
   ),
 );
 
+it.effect("declining removes a recovered value from a save whose record and cleanup failed", () => {
+  const options = { failedRecords: 1, removeFails: true };
+  return withService(
+    ({ service, stored }) =>
+      Effect.gen(function* () {
+        yield* service
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "recovered-value" } })
+          .pipe(Effect.flip);
+        assert.isTrue(Option.isSome(yield* service.savedRef({ threadId, turnItemId })));
+        options.removeFails = false;
+        yield* service.answer({ threadId, turnItemId, answer: { type: "decline" } });
+        assert.isTrue(Option.isNone(yield* service.savedRef({ threadId, turnItemId })));
+        assert.isFalse(valuesOf(stored).some((value) => value.includes("recovered-value")));
+      }),
+    options,
+  );
+});
+
 it.effect("declining stores nothing, and a request is answered once", () =>
   withService(({ service, stored, dispatched }) =>
     Effect.gen(function* () {

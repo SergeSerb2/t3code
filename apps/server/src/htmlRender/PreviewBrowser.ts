@@ -330,9 +330,21 @@ export const makePreviewBrowser = Effect.fn("PreviewBrowser.make")(function* (
         progress.unpacking = true;
         yield* extract(release, archivePath, unpacked);
         const destination = path.join(installRoot, release.version);
-        // A directory left without a runnable binary would block the rename.
-        yield* fs.remove(destination, { recursive: true, force: true });
-        yield* fs.rename(unpacked, destination);
+        // Publish atomically. A concurrent server may already have completed this version.
+        // Never remove its runnable directory, including when this install is interrupted.
+        if (Option.isNone(yield* installedExecutable(release))) {
+          yield* fs
+            .rename(unpacked, destination)
+            .pipe(
+              Effect.catch((error) =>
+                installedExecutable(release).pipe(
+                  Effect.flatMap((installed) =>
+                    Option.isSome(installed) ? Effect.void : Effect.fail(error),
+                  ),
+                ),
+              ),
+            );
+        }
       }).pipe(Effect.scoped);
       // Older builds and abandoned staging directories. Two servers can share a
       // home, so a staging directory touched within the last hour may be another

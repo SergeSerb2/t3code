@@ -3,8 +3,8 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   htmlRenderFileName,
   htmlRenderFrameHeight,
-  htmlRenderThemeFragment,
   htmlRenderThemeMessage,
+  loadRestrictedHtmlRender,
   type HtmlRenderReference,
   type HtmlRenderTheme,
 } from "@t3tools/shared/htmlRender";
@@ -85,7 +85,6 @@ export function HtmlRenderWebView(props: {
   readonly onLoadError?: () => void;
 }) {
   const theme = useHtmlRenderTheme();
-  const [initialTheme] = useState(theme);
   const [generation, setGeneration] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [overflows, setOverflows] = useState(false);
@@ -93,9 +92,23 @@ export function HtmlRenderWebView(props: {
   const crashes = useRef(0);
   // The theme the loaded document shows; null until it loads.
   const shownTheme = useRef<HtmlRenderTheme | null>(null);
+  const [page, setPage] = useState<{ readonly uri: string; readonly html: string } | null>(null);
+  const { uri, onLoadError } = props;
+  useEffect(() => {
+    const request = new AbortController();
+    void loadRestrictedHtmlRender(uri, request.signal).then(
+      (html) => {
+        if (!request.signal.aborted) setPage({ uri, html });
+      },
+      () => {
+        if (!request.signal.aborted) onLoadError?.();
+      },
+    );
+    return () => request.abort();
+  }, [uri, onLoadError]);
   const source = useMemo(
-    () => ({ uri: props.uri + htmlRenderThemeFragment(initialTheme) }),
-    [props.uri, initialTheme],
+    () => (page?.uri === props.uri ? { html: page.html, baseUrl: "about:blank" } : null),
+    [page, props.uri],
   );
   useEffect(() => {
     if (shownTheme.current === null || shownTheme.current === theme) return;
@@ -129,50 +142,50 @@ export function HtmlRenderWebView(props: {
             }
       }
     >
-      <WebView<object>
-        key={generation}
-        ref={webView}
-        source={source}
-        accessibilityLabel={props.title}
-        style={{ flex: 1, backgroundColor: "transparent" }}
-        allowsInlineMediaPlayback
-        automaticallyAdjustContentInsets={!props.nested}
-        bounces={!props.nested}
-        showsVerticalScrollIndicator={!props.nested}
-        showsHorizontalScrollIndicator={!props.nested}
-        scrollEnabled={scrollable}
-        nestedScrollEnabled={props.nested && overflows}
-        overScrollMode={props.nested ? "never" : "always"}
-        // Only the page itself loads here; other top-frame navigations are
-        // dropped. A link the reader taps opens as a new window, which the
-        // platform allows only from a tap, and goes to the browser.
-        onShouldStartLoadWithRequest={(request) =>
-          request.isTopFrame === false ||
-          withoutFragment(request.url) === withoutFragment(props.uri)
-        }
-        onOpenWindow={(event) => {
-          const url = event.nativeEvent.targetUrl;
-          if (/^https?:/i.test(url)) void tryOpenExternalUrl(url, "html-render");
-        }}
-        onLoadEnd={() => {
-          setLoaded(true);
-          shownTheme.current = theme;
-          if (theme !== initialTheme) postTheme(webView.current, theme);
-        }}
-        onError={props.onLoadError}
-        onHttpError={props.onLoadError}
-        onContentProcessDidTerminate={restart}
-        onRenderProcessGone={restart}
-        {...(props.nested
-          ? {
-              injectedJavaScript: OVERFLOW_SCRIPT,
-              onMessage: (event: WebViewMessageEvent) => {
-                const overflow = readOverflowMessage(event.nativeEvent.data);
-                if (overflow !== null) setOverflows(overflow);
-              },
-            }
-          : {})}
-      />
+      {source !== null ? (
+        <WebView<object>
+          key={generation}
+          ref={webView}
+          source={source}
+          accessibilityLabel={props.title}
+          style={{ flex: 1, backgroundColor: "transparent" }}
+          javaScriptCanOpenWindowsAutomatically={false}
+          allowsInlineMediaPlayback
+          automaticallyAdjustContentInsets={!props.nested}
+          bounces={!props.nested}
+          showsVerticalScrollIndicator={!props.nested}
+          showsHorizontalScrollIndicator={!props.nested}
+          scrollEnabled={scrollable}
+          nestedScrollEnabled={props.nested && overflows}
+          overScrollMode={props.nested ? "never" : "always"}
+          // Only the page itself loads here; other top-frame navigations are
+          // dropped. A link the reader taps opens as a new window, which the
+          // platform allows only from a tap, and goes to the browser.
+          onShouldStartLoadWithRequest={(request) => withoutFragment(request.url) === "about:blank"}
+          onOpenWindow={(event) => {
+            const url = event.nativeEvent.targetUrl;
+            if (/^https?:/i.test(url)) void tryOpenExternalUrl(url, "html-render");
+          }}
+          onLoadEnd={() => {
+            setLoaded(true);
+            shownTheme.current = theme;
+            postTheme(webView.current, theme);
+          }}
+          onError={props.onLoadError}
+          onHttpError={props.onLoadError}
+          onContentProcessDidTerminate={restart}
+          onRenderProcessGone={restart}
+          {...(props.nested
+            ? {
+                injectedJavaScript: OVERFLOW_SCRIPT,
+                onMessage: (event: WebViewMessageEvent) => {
+                  const overflow = readOverflowMessage(event.nativeEvent.data);
+                  if (overflow !== null) setOverflows(overflow);
+                },
+              }
+            : {})}
+        />
+      ) : null}
       {loaded ? null : (
         <View pointerEvents="none" className="absolute inset-0 items-center justify-center">
           <ActivityIndicator />

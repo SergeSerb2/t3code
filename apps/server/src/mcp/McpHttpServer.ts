@@ -668,16 +668,26 @@ const registerDeviceScreenshot = Effect.fn("McpHttpServer.registerDeviceScreensh
 
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
+import * as HtmlProjectService from "../project/ProjectService.ts";
+import * as HtmlThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+
 const registerHtmlPreview = Effect.fn("McpHttpServer.registerHtmlPreview")(function* () {
   const htmlRender = yield* HtmlRender.HtmlRender;
   const built = yield* HtmlPreviewToolkit;
+  const projects = yield* HtmlProjectService.ProjectService;
+  const threads = yield* HtmlThreadManagement.ThreadManagementService;
   yield* registerImageTool(
     HtmlPreviewTool,
     (payload) =>
       built
         .handle("html_preview", payload)
         .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
-    (effect) => effect.pipe(Effect.provideService(HtmlRender.HtmlRender, htmlRender)),
+    (effect) =>
+      effect.pipe(
+        Effect.provideService(HtmlRender.HtmlRender, htmlRender),
+        Effect.provideService(HtmlProjectService.ProjectService, projects),
+        Effect.provideService(HtmlThreadManagement.ThreadManagementService, threads),
+      ),
     "preview",
     // Parameter errors and HTML render errors are both written by the server for the agent.
     (error) =>

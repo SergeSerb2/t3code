@@ -112,6 +112,8 @@ import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import { ObservabilityLive } from "./observability/Layers/Observability.ts";
 import * as HeapSnapshot from "./observability/HeapSnapshot.ts";
 import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
+import { readEnvironmentKeyPair } from "./cloud/environmentKeys.ts";
+import { signRelayHookHoldUrl } from "@t3tools/shared/relayJwt";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -472,7 +474,17 @@ const ScheduledTaskWebhookOriginLive = Layer.effect(
         return { relayHookBaseUrl: null };
       }
       const config = decodeRuntimeConfig(new TextDecoder().decode(tunnelConfig.value));
+      // Read the existing link key only. Listing webhook URLs must never create credentials.
+      const keys = yield* readEnvironmentKeyPair(secrets).pipe(Effect.orElseSucceed(Option.none));
       return {
+        ...(Option.isSome(keys)
+          ? {
+              signWebhookUrl: (url: string) =>
+                signRelayHookHoldUrl(url, keys.value.privateKey).pipe(
+                  Effect.orElseSucceed(() => url),
+                ),
+            }
+          : {}),
         relayHookBaseUrl: relayHookBaseUrl({
           relayUrl: new TextDecoder().decode(relayUrl.value),
           tunnelName: Option.isSome(config) ? config.value.tunnelName : undefined,

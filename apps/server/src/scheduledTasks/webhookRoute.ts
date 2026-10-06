@@ -43,6 +43,13 @@ const handleWebhook =
     readonly request: HttpServerRequest.HttpServerRequest;
   }) =>
     Effect.gen(function* () {
+      // The router may dispatch HEAD through its GET route. A probe must never run a task.
+      if (!["GET", "POST", "PUT", "PATCH"].includes(request.method)) {
+        return HttpServerResponse.empty({
+          status: 405,
+          headers: { Allow: "GET, POST, PUT, PATCH" },
+        });
+      }
       const contentLength = Number(request.headers["content-length"] ?? "0");
       if (!Number.isFinite(contentLength) || contentLength > WEBHOOK_MAX_BODY_BYTES) {
         return json(413, { error: "body_too_large" }, "body_too_large");

@@ -1,5 +1,6 @@
 import {
   htmlRenderThemeFragment,
+  loadRestrictedHtmlRender,
   htmlRenderThemeMessage,
   htmlRenderResult,
   readHtmlRenderLinkRequest,
@@ -61,9 +62,9 @@ export function BrowserDocumentFrame(props: {
 
 /**
  * A sandboxed agent HTML render in the app theme. The page reads the theme from
- * its URL fragment before first paint, then follows changes posted to its
- * bootstrap. The first URL is kept for the frame's lifetime: signed asset URLs
- * re-mint while it stays mounted, and a new src would reload the page.
+ * client messages after load and follows subsequent theme changes. Markup is
+ * restricted before execution, including when an older backend serves it.
+ * The first signed URL is kept for the frame's lifetime to avoid reloads.
  */
 export function HtmlRenderDocument(props: {
   readonly src: string;
@@ -74,6 +75,20 @@ export function HtmlRenderDocument(props: {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [src] = useState(() => `${props.src.split("#", 1)[0]}${htmlRenderThemeFragment(theme)}`);
   const [loaded, setLoaded] = useState(false);
+  const [pageHtml, setPageHtml] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const request = new AbortController();
+    void loadRestrictedHtmlRender(src, request.signal).then(
+      (html) => {
+        if (!request.signal.aborted) setPageHtml(html);
+      },
+      () => {
+        if (!request.signal.aborted) setFailed(true);
+      },
+    );
+    return () => request.abort();
+  }, [src]);
   const postTheme = () => {
     frameRef.current?.contentWindow?.postMessage(htmlRenderThemeMessage(theme), "*");
   };
@@ -102,13 +117,15 @@ export function HtmlRenderDocument(props: {
     window.addEventListener("message", openLink);
     return () => window.removeEventListener("message", openLink);
   }, []);
+  if (failed) return <p className="text-muted-foreground text-xs">Unable to load {props.title}</p>;
+  if (pageHtml === null) return null;
   return (
     <iframe
       ref={frameRef}
-      src={src}
+      srcDoc={pageHtml}
       title={props.title}
       // Never allow-same-origin: the opaque origin keeps the page out of the app's session.
-      sandbox="allow-scripts allow-forms"
+      sandbox="allow-scripts"
       loading="lazy"
       onLoad={() => {
         setLoaded(true);

@@ -21,12 +21,12 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import type * as Path from "effect/Path";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
-import * as Stream from "effect/Stream";
 import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
+import { openMediaFile, readMediaFileHeader } from "../assets/MediaFile.ts";
 import { resolveAttachmentRelativePath } from "../attachmentPaths.ts";
 import { createAttachmentId } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
@@ -95,7 +95,10 @@ export class HtmlRender extends Context.Service<
   HtmlRender,
   {
     /** The self-contained page that gets stored: local images inlined, theme bootstrap injected. */
-    readonly prepare: (html: string) => Effect.Effect<string, HtmlRenderPrepareError>;
+    readonly prepare: (
+      html: string,
+      imageRoots?: ReadonlyArray<string>,
+    ) => Effect.Effect<string, HtmlRenderPrepareError>;
     /**
      * Stores a prepared page as a thread attachment for clients to show inline,
      * measuring its height at each client width when the preview browser is
@@ -104,12 +107,14 @@ export class HtmlRender extends Context.Service<
     readonly publish: (input: {
       readonly threadId: ThreadId;
       readonly html: string;
+      readonly imageRoots?: ReadonlyArray<string>;
       readonly title: string;
       readonly height: number;
     }) => Effect.Effect<HtmlRenderReference, HtmlRenderPrepareError | HtmlRenderStoreError>;
     /** Screenshots a page in headless Chrome, tolerating unreadable local images. */
     readonly preview: (input: {
       readonly html: string;
+      readonly imageRoots?: ReadonlyArray<string>;
       readonly width?: number | undefined;
       readonly appearance?: ThemeAppearance | undefined;
     }) => Effect.Effect<
@@ -225,19 +230,34 @@ const afterDoctype = (text: string, from: number) => {
 };
 
 /** Replaces every local image reference with a data URI; unreadable paths stay as written. */
-const inlineLocalImages = Effect.fn("HtmlRender.inlineLocalImages")(function* (html: string) {
+const inlineLocalImages = Effect.fn("HtmlRender.inlineLocalImages")(function* (
+  html: string,
+  imageRoots: ReadonlyArray<string>,
+) {
+  const pathService = yield* Path.Path;
   const fileSystem = yield* FileSystem.FileSystem;
+  const roots = yield* Effect.forEach(imageRoots, (root) =>
+    fileSystem.realPath(root).pipe(Effect.option),
+  );
+  const allowedRoots = roots.flatMap(Option.toArray);
   const references = findLocalImages(html);
   const files = yield* Effect.forEach(
     [...new Set(references.map((reference) => reference.path))],
     (path) =>
-      fileSystem.stat(filePathFor(path)).pipe(
-        Effect.map((info) => ({
-          path,
-          size: info.type === "File" ? Number(info.size) : undefined,
-        })),
-        Effect.orElseSucceed(() => ({ path, size: undefined })),
-      ),
+      Effect.gen(function* () {
+        const canonical = yield* fileSystem.realPath(filePathFor(path));
+        const authorized = allowedRoots.some((root) => {
+          const relative = pathService.relative(root, canonical);
+          return (
+            relative !== ".." &&
+            !relative.startsWith(`..${pathService.sep}`) &&
+            !pathService.isAbsolute(relative)
+          );
+        });
+        if (!authorized) return { path, canonical, size: undefined };
+        const info = yield* fileSystem.stat(canonical);
+        return { path, canonical, size: info.type === "File" ? Number(info.size) : undefined };
+      }).pipe(Effect.orElseSucceed(() => ({ path, canonical: "", size: undefined }))),
     { concurrency: 8 },
   );
   const oversized = files.find((file) => file.size !== undefined && file.size > MAX_IMAGE_BYTES);
@@ -267,9 +287,16 @@ const inlineLocalImages = Effect.fn("HtmlRender.inlineLocalImages")(function* (h
     files.filter((file) => file.size !== undefined),
     (file) =>
       Effect.gen(function* () {
-        const read = yield* fileSystem
-          .stream(filePathFor(file.path), { bytesToRead: MAX_IMAGE_BYTES + 1 })
-          .pipe(Stream.mkUint8Array, Effect.option);
+        const read = yield* Effect.gen(function* () {
+          // Keep the canonical file descriptor: a path swap must not redirect the read.
+          const opened = yield* openMediaFile(file.canonical);
+          if (opened === null) return yield* Effect.fail("unreadable");
+          return yield* readMediaFileHeader(
+            file.canonical,
+            opened,
+            Math.min(Number(opened.info.size) + 1, MAX_IMAGE_BYTES + 1),
+          );
+        }).pipe(Effect.scoped, Effect.option);
         if (Option.isNone(read) || !isImageBytes(read.value)) return [];
         const bytes = read.value;
         if (bytes.byteLength > MAX_IMAGE_BYTES) {
@@ -409,11 +436,16 @@ const make = Effect.gen(function* () {
     );
 
   // The bootstrap goes in first so its head scan never runs over inlined image data.
-  const inline = (html: string) =>
-    inlineLocalImages(injectHtmlRenderBootstrap(html)).pipe(Effect.provideContext(services));
+  const inline = (html: string, imageRoots: ReadonlyArray<string> = []) =>
+    inlineLocalImages(injectHtmlRenderBootstrap(html), imageRoots).pipe(
+      Effect.provideContext(services),
+    );
 
-  const prepare = Effect.fn("HtmlRender.prepare")(function* (html: string) {
-    const inlined = yield* inline(html);
+  const prepare = Effect.fn("HtmlRender.prepare")(function* (
+    html: string,
+    imageRoots: ReadonlyArray<string> = [],
+  ) {
+    const inlined = yield* inline(html, imageRoots);
     if (inlined.missing.length > 0) {
       return yield* new HtmlRenderImagesNotFoundError({ paths: inlined.missing });
     }
@@ -423,10 +455,11 @@ const make = Effect.gen(function* () {
   const publish = Effect.fn("HtmlRender.publish")(function* (input: {
     readonly threadId: ThreadId;
     readonly html: string;
+    readonly imageRoots?: ReadonlyArray<string>;
     readonly title: string;
     readonly height: number;
   }) {
-    const html = yield* prepare(input.html);
+    const html = yield* prepare(input.html, input.imageRoots);
     // The `-html` id suffix makes the asset route serve it as a sandboxed text/html document.
     const attachmentId = createAttachmentId(input.threadId, "html");
     const filePath =
@@ -439,12 +472,23 @@ const make = Effect.gen(function* () {
     if (attachmentId === null || filePath === null) {
       return yield* new HtmlRenderStoreError({ cause: new Error("Invalid thread id.") });
     }
-    const heights = yield* fileSystem.writeFileString(filePath, html).pipe(
+    // Mark only tool-published pages. An uncommitted user upload or draft is not an orphan.
+    const pendingPath = `${filePath}.pending-html-render`;
+    const heights = yield* fileSystem.writeFileString(pendingPath, "").pipe(
+      Effect.andThen(fileSystem.writeFileString(filePath, html)),
       Effect.mapError((cause) => new HtmlRenderStoreError({ cause })),
       Effect.andThen(measure(html)),
       // Only the returned reference lets thread deletion find the page, so a
       // publish that fails or is interrupted before returning removes it.
-      Effect.onError(() => fileSystem.remove(filePath, { force: true }).pipe(Effect.ignore)),
+      Effect.onError(() =>
+        Effect.all(
+          [
+            fileSystem.remove(filePath, { force: true }),
+            fileSystem.remove(pendingPath, { force: true }),
+          ],
+          { discard: true },
+        ).pipe(Effect.ignore),
+      ),
     );
     return {
       attachmentId,
@@ -456,6 +500,7 @@ const make = Effect.gen(function* () {
 
   const preview = Effect.fn("HtmlRender.preview")(function* (input: {
     readonly html: string;
+    readonly imageRoots?: ReadonlyArray<string>;
     readonly width?: number | undefined;
     readonly appearance?: ThemeAppearance | undefined;
   }) {
@@ -464,7 +509,7 @@ const make = Effect.gen(function* () {
       Math.max(MIN_PREVIEW_WIDTH, Math.round(input.width ?? HTML_RENDER_COLUMN_WIDTH)),
     );
     const appearance = input.appearance ?? "dark";
-    const inlined = yield* inline(input.html);
+    const inlined = yield* inline(input.html, input.imageRoots);
     const executable = yield* previewBrowser.executable;
     const theme = htmlRenderTheme(
       appearance === "light" ? T3_CODE_LIGHT_THEME_COLORS : T3_CODE_DARK_THEME_COLORS,

@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  loadRestrictedHtmlRender,
   htmlRenderFrameHeight,
   htmlRenderReferencesEqual,
   htmlRenderTheme,
@@ -16,6 +17,22 @@ import { htmlRenderFromToolItem } from "./toolOutput.ts";
 const reference = { attachmentId: "thread-abc-123.html", title: "Chart", height: 420 };
 
 describe("injectHtmlRenderBootstrap", () => {
+  it("establishes resource restrictions before an executable prefix and blocks all network resource types", () => {
+    const injected = injectHtmlRenderBootstrap(
+      '<script>fetch("http://192.168.1.1/")</script><head></head>',
+    );
+    expect(injected.indexOf('http-equiv="Content-Security-Policy"')).toBeLessThan(
+      injected.indexOf("<script>fetch"),
+    );
+    for (const directive of [
+      "default-src 'none'",
+      "connect-src 'none'",
+      "frame-src 'none'",
+      "form-action 'none'",
+      "img-src data: blob:",
+    ])
+      expect(injected).toContain(directive);
+  });
   it("puts the theme ahead of the page's own head content", () => {
     const html =
       "<!doctype html><html><head><style>:root{--background:red}</style></head><body>x</body></html>";
@@ -31,7 +48,9 @@ describe("injectHtmlRenderBootstrap", () => {
     const fragment =
       '<meta charset="utf-8"><meta name="viewport" content="width=device-width"><p>hi</p>';
     const injected = injectHtmlRenderBootstrap(fragment);
-    expect(injected.startsWith("<!doctype html><head>")).toBe(true);
+    expect(injected.startsWith('<!doctype html><meta http-equiv="Content-Security-Policy"')).toBe(
+      true,
+    );
     expect(injected.match(/charset/g)).toHaveLength(1);
     expect(injected.match(/name="viewport"/g)).toHaveLength(1);
     expect(injected.endsWith("<p>hi</p>")).toBe(true);
@@ -42,7 +61,9 @@ describe("injectHtmlRenderBootstrap", () => {
     (tag) => {
       const fragment = `<${tag}><head><meta name="viewport"></head></${tag}>`;
       const injected = injectHtmlRenderBootstrap(fragment);
-      expect(injected.startsWith("<!doctype html><head>")).toBe(true);
+      expect(injected.startsWith('<!doctype html><meta http-equiv="Content-Security-Policy"')).toBe(
+        true,
+      );
       expect(injected.indexOf('<style id="t3-theme">')).toBeLessThan(injected.indexOf(`<${tag}>`));
       expect(injected).toContain('<meta name="viewport" content="width=device-width');
       expect(injected.endsWith(fragment)).toBe(true);
@@ -54,7 +75,9 @@ describe("injectHtmlRenderBootstrap", () => {
     '<template><template>inner</template><head><meta name="viewport"></head></template>',
   ])("keeps the bootstrap outside inert template content: %s", (fragment) => {
     const injected = injectHtmlRenderBootstrap(fragment);
-    expect(injected.startsWith("<!doctype html><head>")).toBe(true);
+    expect(injected.startsWith('<!doctype html><meta http-equiv="Content-Security-Policy"')).toBe(
+      true,
+    );
     expect(injected.indexOf('<style id="t3-theme">')).toBeLessThan(injected.indexOf("<template>"));
     expect(injected).toContain('<meta name="viewport" content="width=device-width');
     expect(injected.endsWith(fragment)).toBe(true);
@@ -206,4 +229,39 @@ describe("htmlRenderFrameHeight", () => {
     expect(htmlRenderReferencesEqual(measured, copy)).toBe(true);
     expect(htmlRenderReferencesEqual(measured, { ...copy, heights: [[390, 1290]] })).toBe(false);
   });
+});
+
+const htmlRenderFetch = vi.fn<typeof fetch>();
+
+it("restricts older backend markup before a client can execute it", async () => {
+  const markup = '<script>fetch("http://192.168.1.1/")</script><head></head>';
+  vi.stubGlobal("fetch", htmlRenderFetch.mockResolvedValue(new Response(markup)));
+  try {
+    const html = await loadRestrictedHtmlRender(
+      "https://backend.test/signed-asset",
+      new AbortController().signal,
+    );
+    expect(html.indexOf('http-equiv="Content-Security-Policy"')).toBeLessThan(
+      html.indexOf("<script>fetch"),
+    );
+    expect(html).toContain("connect-src 'none'");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it("does not hand an error response or oversized document to a client browser", async () => {
+  try {
+    for (const response of [
+      new Response("denied", { status: 403 }),
+      new Response("small", { headers: { "content-length": String(26 * 1024 * 1024) } }),
+    ]) {
+      vi.stubGlobal("fetch", htmlRenderFetch.mockResolvedValue(response));
+      await expect(
+        loadRestrictedHtmlRender("https://backend.test/signed-asset", new AbortController().signal),
+      ).rejects.toBeInstanceOf(Error);
+    }
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

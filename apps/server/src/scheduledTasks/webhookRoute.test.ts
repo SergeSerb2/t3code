@@ -111,6 +111,22 @@ const post = (
 ) => new Request(`http://env.local${path}`, { method: "POST", body, headers });
 
 describe("webhook route", () => {
+  it("rejects HEAD without dispatching a task", async () => {
+    let calls = 0;
+    const { handler, dispose } = handlerFor(() => {
+      calls += 1;
+      return Effect.succeed({ _tag: "not_found" });
+    });
+    try {
+      const response = await handler(
+        new Request("http://env.local/api/hooks/hook/token", { method: "HEAD" }),
+      );
+      expect(response.status).toBe(405);
+      expect(calls).toBe(0);
+    } finally {
+      await dispose();
+    }
+  });
   it("passes the raw request to the service and answers 202 with the delivery id", async () => {
     let received: WebhookTriggerRequest | undefined;
     const { handler, dispose } = handlerFor((request) => {

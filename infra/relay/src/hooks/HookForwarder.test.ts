@@ -36,7 +36,11 @@ import {
   traceRelayHttpRequestWith,
 } from "../http/Api.ts";
 import * as HookForwarder from "./HookForwarder.ts";
-import { RELAY_HOOK_DELIVERY_TYP, verifyRelayJwt } from "@t3tools/shared/relayJwt";
+import {
+  RELAY_HOOK_DELIVERY_TYP,
+  verifyRelayJwt,
+  signRelayHookHoldUrl,
+} from "@t3tools/shared/relayJwt";
 import * as HookInbox from "./HookInbox.ts";
 import type { HeldHook } from "./HookInboxStore.ts";
 import { RELAY_HOOK_UPSTREAM_TIMEOUT_MS } from "./upstream.ts";
@@ -83,7 +87,7 @@ const managedLink = {
     wsBaseUrl: "wss://env.example.test/ws",
     providerKind: "cloudflare_tunnel" as const,
   },
-  environmentPublicKey: "public-key",
+  environmentPublicKey: mintKeys.publicKey,
   linkedAt: "2026-05-25T00:00:00.000Z",
   holdWebhooksWhileOffline: false,
 };
@@ -490,7 +494,12 @@ describe("HookForwarder", () => {
       });
       const arrivedAt = DateTime.formatIso(yield* DateTime.now);
       const fiber = yield* harness
-        .send(new Request(hookUrl(), { method: "POST", body: "{}" }))
+        .send(
+          new Request(yield* signRelayHookHoldUrl(hookUrl(), mintKeys.privateKey), {
+            method: "POST",
+            body: "{}",
+          }),
+        )
         .pipe(Effect.forkChild);
       yield* Deferred.await(reachedUpstream);
       yield* TestClock.adjust(Duration.millis(RELAY_HOOK_UPSTREAM_TIMEOUT_MS));
@@ -717,6 +726,35 @@ describe("HookForwarder", () => {
         }),
       );
 
+    it.effect(
+      "invalid and replayed capabilities cannot consume another hook's offline capacity",
+      () =>
+        Effect.gen(function* () {
+          const harness = makeHarness({
+            execute: offline,
+            links: [{ ...managedLink, holdWebhooksWhileOffline: true }],
+          });
+          const signed = yield* signRelayHookHoldUrl(hookUrl(), mintKeys.privateKey);
+          const altered = new URL(signed);
+          altered.pathname = altered.pathname.replace("/hook-1/", "/hook-2/");
+          const rotated = new URL(signed);
+          rotated.pathname = rotated.pathname.replace("/secret-token", "/rotated-token");
+          for (const url of [
+            hookUrl(),
+            altered.toString(),
+            rotated.toString(),
+            `${hookUrl()}?t3_hold_proof=forged`,
+          ]) {
+            const response = yield* harness.send(new Request(url, { method: "POST" }));
+            expect(response.status).toBe(401);
+          }
+          expect(harness.held).toHaveLength(0);
+          expect((yield* harness.send(new Request(signed, { method: "POST" }))).status).toBe(202);
+          expect(harness.held).toHaveLength(1);
+          expect(harness.held[0]?.query).toBe("");
+        }),
+    );
+
     it.effect("holds when cloudflared answers that the local server is down", () =>
       Effect.gen(function* () {
         for (const status of [502, 503, 504, 530]) {
@@ -726,7 +764,10 @@ describe("HookForwarder", () => {
               Effect.succeed(HttpClientResponse.fromWeb(request, new Response("", { status }))),
           });
           const response = yield* harness.send(
-            new Request(hookUrl(), { method: "POST", body: "{}" }),
+            new Request(yield* signRelayHookHoldUrl(hookUrl(), mintKeys.privateKey), {
+              method: "POST",
+              body: "{}",
+            }),
           );
           expect(response.status).toBe(202);
           expect(harness.held).toHaveLength(1);
@@ -738,7 +779,10 @@ describe("HookForwarder", () => {
       Effect.gen(function* () {
         const harness = makeHarness({ execute: offline });
         const response = yield* harness.send(
-          new Request(hookUrl(), { method: "POST", body: "{}" }),
+          new Request(yield* signRelayHookHoldUrl(hookUrl(), mintKeys.privateKey), {
+            method: "POST",
+            body: "{}",
+          }),
         );
         expect(response.status).toBe(503);
         expect(harness.held).toHaveLength(0);
@@ -753,11 +797,14 @@ describe("HookForwarder", () => {
         });
         const body = new Uint8Array([0, 255, 10]);
         const response = yield* harness.send(
-          new Request(hookUrl("%68ook-1/tok%2Fen", "?a=1"), {
-            method: "POST",
-            body,
-            headers: { "x-t3-relay-delivery-id": "forged", "x-sig": "s" },
-          }),
+          new Request(
+            yield* signRelayHookHoldUrl(hookUrl("%68ook-1/tok%2Fen", "?a=1"), mintKeys.privateKey),
+            {
+              method: "POST",
+              body,
+              headers: { "x-t3-relay-delivery-id": "forged", "x-sig": "s" },
+            },
+          ),
         );
         expect(response.status).toBe(202);
         const [hook] = harness.held;
@@ -782,7 +829,10 @@ describe("HookForwarder", () => {
           inboxCapacity: 0,
         });
         const response = yield* harness.send(
-          new Request(hookUrl(), { method: "POST", body: "{}" }),
+          new Request(yield* signRelayHookHoldUrl(hookUrl(), mintKeys.privateKey), {
+            method: "POST",
+            body: "{}",
+          }),
         );
         expect(response.status).toBe(503);
         expect(yield* readJson(response)).toEqual({ error: "inbox_full" });
@@ -793,7 +843,7 @@ describe("HookForwarder", () => {
       Effect.gen(function* () {
         const harness = makeHarness();
         yield* harness.send(
-          new Request(hookUrl(), {
+          new Request(yield* signRelayHookHoldUrl(hookUrl(), mintKeys.privateKey), {
             method: "POST",
             body: "{}",
             headers: { "x-t3-relay-delivery-id": "forged" },

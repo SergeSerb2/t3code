@@ -1,3 +1,6 @@
+import * as Effect from "effect/Effect";
+import * as HttpClient from "effect/http/HttpClient";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import {
   T3_CODE_DARK_THEME_COLORS,
   T3_CODE_LIGHT_THEME_COLORS,
@@ -360,7 +363,10 @@ const blankNonMarkup = (html: string) => {
  * Inserts the theme bootstrap at the start of the document head, so a page's
  * own styles and scripts come after it.
  */
-export function injectHtmlRenderBootstrap(html: string): string {
+export const HTML_RENDER_RESOURCE_POLICY =
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+
+function injectHtmlRenderThemeBootstrap(html: string): string {
   const scan = blankNonMarkup(html);
   const markup = bootstrapMarkup(scan);
   const headOpen = /<head(?:\s[^>]*)?>/i.exec(scan);
@@ -379,4 +385,42 @@ export function injectHtmlRenderBootstrap(html: string): string {
     return `${html.slice(0, at)}<head>${markup}</head>${html.slice(at)}`;
   }
   return `<!doctype html><head>${markup}</head>${html}`;
+}
+
+/** Establish resource restrictions before any untrusted markup, even a script preceding its head. */
+export function injectHtmlRenderBootstrap(html: string): string {
+  return restrictHtmlRenderResources(injectHtmlRenderThemeBootstrap(html));
+}
+
+export function restrictHtmlRenderResources(document: string): string {
+  const doctype = /^\s*<!doctype[^>]*>/i.exec(document);
+  const at = doctype?.[0].length ?? 0;
+  return (
+    document.slice(0, at) +
+    `<meta http-equiv="Content-Security-Policy" content="${HTML_RENDER_RESOURCE_POLICY}">` +
+    document.slice(at)
+  );
+}
+
+/** Read before handing untrusted markup to a browser, including when an older backend serves it. */
+export function loadRestrictedHtmlRender(url: string, signal: AbortSignal): Promise<string> {
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const response = yield* HttpClient.get(url);
+      if (response.status < 200 || response.status >= 300)
+        return yield* Effect.fail(new Error("Unable to load HTML render."));
+      const contentLength = Number(response.headers["content-length"] ?? 0);
+      if (contentLength > 25 * 1024 * 1024)
+        return yield* Effect.fail(new Error("HTML render is too large."));
+      const document = yield* response.text;
+      if (new TextEncoder().encode(document).byteLength > 25 * 1024 * 1024)
+        return yield* Effect.fail(new Error("HTML render is too large."));
+      return restrictHtmlRenderResources(document);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(FetchHttpClient.layer),
+      Effect.provideService(FetchHttpClient.RequestInit, { credentials: "omit" }),
+    ),
+    { signal },
+  );
 }

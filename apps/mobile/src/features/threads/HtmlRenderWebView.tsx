@@ -8,10 +8,11 @@ import {
   type HtmlRenderReference,
   type HtmlRenderTheme,
 } from "@t3tools/shared/htmlRender";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Platform, Pressable, View, type ColorValue } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 
+import { EmptyState } from "../../components/EmptyState";
 import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
 import { mobileHtmlRenderTheme } from "../../lib/htmlRenderTheme";
@@ -83,17 +84,26 @@ export function HtmlRenderWebView(props: {
   /** Inside the feed, the page takes scroll gestures only when it overflows its frame. */
   readonly nested: boolean;
   readonly onLoadError?: () => void;
+  /** Full-screen retry reauthorizes an expired asset URL before remounting. */
+  readonly onRetry?: () => void;
 }) {
   const theme = useHtmlRenderTheme();
   const [generation, setGeneration] = useState(0);
   const [loaded, setLoaded] = useState(false);
+  const [failedUri, setFailedUri] = useState<string | null>(null);
   const [overflows, setOverflows] = useState(false);
   const webView = useRef<WebView<object>>(null);
   const crashes = useRef(0);
   // The theme the loaded document shows; null until it loads.
   const shownTheme = useRef<HtmlRenderTheme | null>(null);
   const [page, setPage] = useState<{ readonly uri: string; readonly html: string } | null>(null);
-  const { uri, onLoadError } = props;
+  const { uri } = props;
+  const handleLoadError = () => {
+    setFailedUri(uri);
+    props.onLoadError?.();
+  };
+  // Streaming parent renders may replace callbacks without changing the page URL.
+  const reportFetchError = useEffectEvent(handleLoadError);
   useEffect(() => {
     const request = new AbortController();
     void loadRestrictedHtmlRender(uri, request.signal).then(
@@ -101,11 +111,11 @@ export function HtmlRenderWebView(props: {
         if (!request.signal.aborted) setPage({ uri, html });
       },
       () => {
-        if (!request.signal.aborted) onLoadError?.();
+        if (!request.signal.aborted) reportFetchError();
       },
     );
     return () => request.abort();
-  }, [uri, onLoadError]);
+  }, [uri]);
   const source = useMemo(
     () => (page?.uri === props.uri ? { html: page.html, baseUrl: "about:blank" } : null),
     [page, props.uri],
@@ -119,7 +129,7 @@ export function HtmlRenderWebView(props: {
     // A page that keeps crashing its web process is not reloaded forever.
     crashes.current += 1;
     if (crashes.current > 1) {
-      props.onLoadError?.();
+      handleLoadError();
       return;
     }
     shownTheme.current = null;
@@ -127,6 +137,18 @@ export function HtmlRenderWebView(props: {
     setOverflows(false);
     setGeneration((value) => value + 1);
   };
+  if (failedUri === uri) {
+    return (
+      <View className="flex-1 items-center justify-center bg-sheet px-6">
+        <EmptyState
+          title="File unavailable"
+          detail="Could not load this page. Reconnect and try again."
+          actionLabel="Try again"
+          onAction={props.onRetry}
+        />
+      </View>
+    );
+  }
   const scrollable = !props.nested || overflows;
   // Pages have no horizontal padding of their own, so full screen adds the
   // feed's gutter in the page's background color.
@@ -171,8 +193,8 @@ export function HtmlRenderWebView(props: {
             shownTheme.current = theme;
             postTheme(webView.current, theme);
           }}
-          onError={props.onLoadError}
-          onHttpError={props.onLoadError}
+          onError={handleLoadError}
+          onHttpError={handleLoadError}
           onContentProcessDidTerminate={restart}
           onRenderProcessGone={restart}
           {...(props.nested

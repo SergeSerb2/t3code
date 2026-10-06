@@ -510,3 +510,14 @@ it.effect("a failed claim commit leaves the secret value available for retry", (
     }),
   ),
 );
+
+it.effect("saved secret consumption preserves intentional whitespace bytes", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const secret = " \n-----BEGIN KEY-----\nvalue\n-----END KEY-----\n ";
+      yield* service.answer({ threadId, turnItemId, answer: { type: "save", secret } });
+      const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
+      assert.equal(yield* service.consume({ ref, projectId }), secret);
+    }),
+  ),
+);

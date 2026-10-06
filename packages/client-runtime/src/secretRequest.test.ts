@@ -47,12 +47,12 @@ describe("secretRequestDisplay", () => {
 });
 
 describe("secretRequestAnswerInput", () => {
-  it("refuses a blank save and trims the value the server will store", () => {
+  it("refuses a blank save and preserves the exact value the server will store", () => {
     expect(secretRequestAnswerInput(item, { type: "save", secret: "   " })).toBeNull();
     expect(secretRequestAnswerInput(item, { type: "save", secret: " whsec_1 " })).toEqual({
       threadId: item.threadId,
       turnItemId: item.id,
-      answer: { type: "save", secret: "whsec_1" },
+      answer: { type: "save", secret: " whsec_1 " },
     });
     expect(secretRequestAnswerInput(item, { type: "decline" })).toEqual({
       threadId: item.threadId,

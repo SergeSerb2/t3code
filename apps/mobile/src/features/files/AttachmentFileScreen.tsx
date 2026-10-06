@@ -146,7 +146,13 @@ function AttachmentDocumentBody(props: {
   }
   if (document.kind === "html") {
     return props.htmlRender ? (
-      <HtmlRenderWebView key={document.uri} uri={document.uri} title={props.name} nested={false} />
+      <HtmlRenderWebView
+        key={document.revision}
+        uri={document.uri}
+        title={props.name}
+        nested={false}
+        onRetry={document.retry}
+      />
     ) : (
       <WorkspaceFileWebPreview uri={document.uri} />
     );

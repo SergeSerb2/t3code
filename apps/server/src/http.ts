@@ -4,7 +4,6 @@ import {
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
 } from "@t3tools/contracts";
-import { HTML_RENDER_RESOURCE_POLICY } from "@t3tools/shared/htmlRender";
 import { isDevProxiedPath } from "@t3tools/shared/devProxy";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
@@ -59,7 +58,10 @@ const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inlin
 // out of reach. Relative sibling assets still load through their signed URLs.
 // No modals: agent HTML can open without a click (inline renders, and mobile
 // loads it as the top document), and must not raise blocking dialogs.
-const HTML_CONTENT_SECURITY_POLICY = `${HTML_RENDER_RESOURCE_POLICY}; sandbox allow-scripts allow-popups`;
+// html_render publications carry their stricter resource policy in the document,
+// and clients restrict older backend responses before executing them. Ordinary
+// HTML previews retain signed sibling resources and their opaque-origin sandbox.
+const HTML_CONTENT_SECURITY_POLICY = "sandbox allow-scripts allow-forms allow-popups";
 
 // Types a browser may render as a document if a proxy strips the disposition
 // header. Downloads of these fall back to octet-stream.

@@ -28,6 +28,8 @@ import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlError from "effect/sql/SqlError";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as Metrics from "../observability/Metrics.ts";
@@ -86,11 +88,21 @@ export class SecretRequests extends Context.Service<
       readonly ref: SecretRef;
       readonly projectId: ProjectId;
     }) => Effect.Effect<string, SecretRequestError>;
+    /** Commit a consumer's database write and its one-use claim together. */
+    readonly consumeWith: <A, E, R>(
+      input: {
+        readonly ref: SecretRef;
+        readonly projectId: ProjectId;
+        readonly consumerId?: string;
+      },
+      persist: (value: string) => Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | SecretRequestError, R>;
   }
 >()("t3/secrets/SecretRequests") {}
 
 const make = Effect.gen(function* () {
   const store = yield* ServerSecretStore.ServerSecretStore;
+  const sql = yield* SqlClient.SqlClient;
   const fileSystem = yield* FileSystem.FileSystem;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
 
@@ -205,8 +217,55 @@ const make = Effect.gen(function* () {
   // get and remove are separate store calls; one consumer at a time keeps two
   // concurrent calls from both reading a ref before either deletes it.
   const consumeLock = yield* Semaphore.make(1);
+  const readRef = (input: { readonly ref: SecretRef; readonly projectId: ProjectId }) =>
+    Effect.gen(function* () {
+      if (!REF_PATTERN.test(input.ref)) return yield* fail("invalid_ref");
+      const used = yield* sql`SELECT secret_ref FROM consumed_secret_request_refs
+        WHERE secret_ref = ${input.ref}`.pipe(
+        Effect.mapError((cause) => fail("read_failed", cause)),
+      );
+      if (used.length > 0) return yield* fail("ref_unavailable");
+      const stored = yield* store
+        .get(storeName(input.ref))
+        .pipe(Effect.mapError((cause) => fail("read_failed", cause)));
+      const decoded = Option.flatMap(stored, (bytes) =>
+        decodeStored(new TextDecoder().decode(bytes)),
+      );
+      if (Option.isNone(decoded) || decoded.value.projectId !== input.projectId)
+        return yield* fail("ref_unavailable");
+      if ((yield* Clock.currentTimeMillis) - decoded.value.savedAt > SECRET_REF_TTL_MS) {
+        yield* removeLogged(storeName(input.ref));
+        return yield* fail("ref_expired");
+      }
+      return decoded.value.value;
+    });
+  const claimRef = (ref: SecretRef, consumerId?: string) =>
+    Effect.gen(function* () {
+      const rows = yield* sql`INSERT INTO consumed_secret_request_refs
+      (secret_ref, consumer_id, consumed_at)
+      VALUES (${ref}, ${consumerId ?? null}, ${yield* Clock.currentTimeMillis})
+      ON CONFLICT (secret_ref) DO NOTHING RETURNING secret_ref`.pipe(
+        Effect.mapError((cause) => fail("consume_failed", cause)),
+      );
+      if (rows.length === 0) return yield* fail("ref_unavailable");
+    });
   const consume: SecretRequests["Service"]["consume"] = (input) =>
-    consumeRef(input).pipe(
+    Effect.gen(function* () {
+      const value = yield* readRef(input);
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* claimRef(input.ref);
+            if (!(yield* removeLogged(storeName(input.ref)))) return yield* fail("consume_failed");
+            return value;
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            Schema.is(SecretRequestError)(cause) ? cause : fail("consume_failed", cause),
+          ),
+        );
+    }).pipe(
       consumeLock.withPermits(1),
       Effect.tap(() => Metrics.increment(Metrics.secretRefsConsumedTotal, { result: "used" })),
       Effect.tapError(() =>
@@ -214,39 +273,43 @@ const make = Effect.gen(function* () {
       ),
       Effect.withSpan("SecretRequests.consume"),
     );
-
-  const consumeRef = (input: { readonly ref: SecretRef; readonly projectId: ProjectId }) =>
+  const consumeWith: SecretRequests["Service"]["consumeWith"] = <A, E, R>(
+    input: {
+      readonly ref: SecretRef;
+      readonly projectId: ProjectId;
+      readonly consumerId?: string;
+    },
+    persist: (value: string) => Effect.Effect<A, E, R>,
+  ) =>
     Effect.gen(function* () {
-      if (!REF_PATTERN.test(input.ref)) return yield* fail("invalid_ref");
-      const stored = yield* store
-        .get(storeName(input.ref))
-        .pipe(Effect.mapError((cause) => fail("read_failed", cause)));
-      const decoded = Option.flatMap(stored, (bytes) =>
-        decodeStored(new TextDecoder().decode(bytes)),
-      );
-      if (Option.isNone(decoded) || decoded.value.projectId !== input.projectId) {
-        return yield* fail("ref_unavailable");
-      }
-      if ((yield* Clock.currentTimeMillis) - decoded.value.savedAt > SECRET_REF_TTL_MS) {
-        // The hourly sweep retries a removal that fails here.
-        yield* removeLogged(storeName(input.ref));
-        return yield* fail("ref_expired");
-      }
-      // One use: the value moves into whatever consumed it. If it cannot be
-      // deleted, it is not handed out, so a ref is never used twice.
-      if (!(yield* removeLogged(storeName(input.ref)))) {
-        return yield* fail("consume_failed");
-      }
-      return decoded.value.value;
-    });
+      const value = yield* readRef(input);
+      // A failed save rolls back the claim and never removes the stored value.
+      // Once committed, the claim prevents reuse even if file cleanup fails.
+      const result = yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* claimRef(input.ref, input.consumerId);
+            return yield* persist(value);
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            SqlError.isSqlError(error) ? fail("consume_failed", error) : error,
+          ),
+        );
+      yield* removeLogged(storeName(input.ref));
+      yield* Metrics.increment(Metrics.secretRefsConsumedTotal, { result: "used" });
+      return result;
+    }).pipe(consumeLock.withPermits(1), Effect.withSpan("SecretRequests.consumeWith"));
 
   /**
    * Drops values nobody used before they expired, so an agent that never
    * consumed its ref does not leave the user's secret on disk.
    */
   const sweepExpired = Effect.gen(function* () {
-    if (store.directory === undefined) return;
     const now = yield* Clock.currentTimeMillis;
+    yield* sql`DELETE FROM consumed_secret_request_refs WHERE consumed_at < ${now - SECRET_REF_TTL_MS}`;
+    if (store.directory === undefined) return;
     const names = (yield* fileSystem.readDirectory(store.directory)).flatMap((file) => {
       const match = STORE_NAME_PATTERN.exec(file);
       return match?.[1] === undefined ? [] : [match[1]];
@@ -273,7 +336,7 @@ const make = Effect.gen(function* () {
     Effect.forkScoped,
   );
 
-  return SecretRequests.of({ answer, savedRef, consume });
+  return SecretRequests.of({ answer, savedRef, consume, consumeWith });
 });
 
 export const layer = Layer.effect(SecretRequests, make);

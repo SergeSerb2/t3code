@@ -20,6 +20,7 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "./SecretRequests.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 
 const threadId = ThreadId.make("thread-orchestrator");
 const turnItemId = TurnItemId.make("turn-item:secret-request:1");
@@ -131,7 +132,7 @@ const withService = <A, E>(
       const service = yield* SecretRequests.SecretRequests;
       return yield* body({ service, stored, dispatched });
     }).pipe(Effect.provide(SecretRequests.layer.pipe(Layer.provide(dependencies))));
-  });
+  }).pipe(Effect.provide(SqlitePersistenceMemory));
 
 /** The secret values in the store, leaving out the server's own salt. */
 const valuesOf = (stored: Map<string, Uint8Array>) =>
@@ -374,6 +375,7 @@ it.effect("drops values nobody used once they expire, and keeps the rest", () =>
       Effect.provide(
         SecretRequests.layer.pipe(
           Layer.provide(Layer.mock(ThreadManagementService.ThreadManagementService)({})),
+          Layer.provide(SqlitePersistenceMemory),
         ),
       ),
       Effect.scoped,
@@ -407,6 +409,57 @@ it.effect("a used value that cannot be deleted is not handed out", () =>
         const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
         const failed = yield* service.consume({ ref, projectId }).pipe(Effect.flip);
         assert.include(failed.message, "Could not use");
+      }),
+    { removeFails: true },
+  ),
+);
+
+it.effect("a failed consumer save retains the ref and a retry consumes it once", () =>
+  withService(({ service, stored }) =>
+    Effect.gen(function* () {
+      yield* service.answer({
+        threadId,
+        turnItemId,
+        answer: { type: "save", secret: "private-value" },
+      });
+      const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
+      const failed = yield* service
+        .consumeWith({ ref, projectId }, () => Effect.fail("save failed"))
+        .pipe(Effect.flip);
+      assert.equal(failed, "save failed");
+      assert.equal(valuesOf(stored).length, 1);
+      assert.equal(
+        yield* service.consumeWith({ ref, projectId }, (value) => Effect.succeed(value)),
+        "private-value",
+      );
+      assert.deepEqual(valuesOf(stored), []);
+      assert.equal(
+        (yield* service.consume({ ref, projectId }).pipe(Effect.flip)).reason,
+        "ref_unavailable",
+      );
+    }),
+  ),
+);
+it.effect("a committed consumer cannot reuse a ref even if file cleanup fails", () =>
+  withService(
+    ({ service }) =>
+      Effect.gen(function* () {
+        yield* service.answer({
+          threadId,
+          turnItemId,
+          answer: { type: "save", secret: "private-value" },
+        });
+        const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
+        assert.equal(
+          yield* service.consumeWith({ ref, projectId }, () => Effect.succeed("saved")),
+          "saved",
+        );
+        assert.equal(
+          (yield* service
+            .consumeWith({ ref, projectId }, () => Effect.succeed("again"))
+            .pipe(Effect.flip)).reason,
+          "ref_unavailable",
+        );
       }),
     { removeFails: true },
   ),

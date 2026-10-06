@@ -96,8 +96,6 @@ const TASK_WAKE_EVENTS = [
   { thread: "child", eventType: "subagent.updated" },
   { thread: "child", eventType: "provider-thread.updated" },
 ] as const;
-/** A person answers the card, so a slower poll is plenty. */
-const SECRET_REQUEST_POLL_INTERVAL_MS = 500;
 const DEFAULT_THREAD_LIST_LIMIT = 50;
 const DEFAULT_THREAD_READ_LIMIT = 50;
 const DEFAULT_THREAD_RUN_LIMIT = 10;
@@ -1598,37 +1596,52 @@ const make = Effect.gen(function* () {
           ),
         );
 
-        // The user answers the card (secrets.answerRequest), or it ends with
-        // the run; poll it like a delegated task.
+        // Take a cursor before the first read so an answer racing the
+        // subscription is replayed. Only card/run events wake this waiter.
         const answered = yield* Effect.gen(function* () {
-          while (true) {
+          const streamError = (error: unknown) =>
+            failure(
+              "orchestration_error",
+              `Unable to watch the secret request: ${errorMessage(error)}`,
+            );
+          const afterSequence = yield* threadManagement
+            .getThreadEventSequence(threadId)
+            .pipe(Effect.mapError(streamError));
+          const readStatus = Effect.gen(function* () {
             const projection = yield* threadManagement
               .getThreadRecords(threadId, ["runs", "turnItems"], {
                 turnItemTypes: ["secret_request"],
                 messageRoles: [],
               })
-              .pipe(
-                Effect.mapError((error) =>
-                  failure(
-                    "orchestration_error",
-                    `Unable to read the secret request: ${errorMessage(error)}`,
-                  ),
-                ),
-              );
+              .pipe(Effect.mapError(streamError));
             const item = projection.turnItems.find((candidate) => candidate.id === turnItemId);
-            if (item?.type === "secret_request" && item.secretStatus !== "pending") {
-              return item.secretStatus;
-            }
+            if (item?.type === "secret_request" && item.secretStatus !== "pending")
+              return Option.some(item.secretStatus);
             const current = projection.runs.find((candidate) => candidate.id === runId);
             if (
               current === undefined ||
               ThreadManagementService.isTerminalRunStatus(current.status)
             ) {
               yield* record("cancelled");
-              return "cancelled" as const;
+              return Option.some("cancelled" as const);
             }
-            yield* Effect.sleep(Duration.millis(SECRET_REQUEST_POLL_INTERVAL_MS));
-          }
+            return Option.none();
+          });
+          const initial = yield* readStatus;
+          if (Option.isSome(initial)) return initial.value;
+          const result = yield* Stream.mergeAll(
+            (["turn-item.updated", "run.updated"] as const).map((eventType) =>
+              threadManagement.streamStoredEventsFrom({ threadId, afterSequence, eventType }),
+            ),
+            { concurrency: "unbounded" },
+          ).pipe(
+            Stream.mapError(streamError),
+            Stream.mapEffect(() => readStatus),
+            Stream.filter(Option.isSome),
+            Stream.map((status) => status.value),
+            Stream.runHead,
+          );
+          return Option.getOrElse(result, () => "cancelled" as const);
         }).pipe(
           Effect.timeoutOption(
             Duration.millis(

@@ -1826,7 +1826,7 @@ function ConfiguredCloudLinkRow({ canManageRelay }: { readonly canManageRelay: b
         title: enabled ? "Webhooks held while offline" : "Webhooks no longer held",
         description: enabled
           ? "T3 Connect keeps webhook requests for up to 24 hours while this environment is offline."
-          : "Requests to an offline environment now fail. Anything already held is still delivered.",
+          : "Requests to an offline environment now fail. Any queued webhook requests are discarded.",
       });
     }
     setIsUpdatingPreference(false);

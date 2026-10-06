@@ -12,6 +12,11 @@ import * as Metric from "effect/Metric";
 import * as Queue from "effect/Queue";
 import * as EffectScheduler from "effect/Scheduler";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlError from "effect/sql/SqlError";
+import * as Context from "effect/Context";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -69,10 +74,13 @@ const withService = <A, E>(
     readonly launches: Queue.Queue<LaunchInput>;
     /** Secrets the user entered for an agent, by ref; consuming one removes it. */
     readonly secretsByRef: Map<string, string>;
+    readonly sql: SqlClient.SqlClient;
+    readonly restart: Effect.Effect<ScheduledTaskService.ScheduledTaskService["Service"]>;
   }) => Effect.Effect<A, E, never>,
   options: { readonly gate?: Deferred.Deferred<void>; readonly relayHookBaseUrl?: string } = {},
 ) =>
   Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
     const launches = yield* Queue.unbounded<LaunchInput>();
     const secretsByRef = new Map<string, string>();
     const dependencies = Layer.mergeAll(
@@ -87,6 +95,27 @@ const withService = <A, E>(
       }),
       Layer.mock(ThreadManagementService.ThreadManagementService)({}),
       Layer.mock(SecretRequests.SecretRequests)({
+        consumeWith: (input, persist) =>
+          Effect.gen(function* () {
+            const value = secretsByRef.get(input.ref);
+            if (value === undefined)
+              return yield* new SecretRequestError({ reason: "ref_unavailable" });
+            const result = yield* sql.withTransaction(
+              Effect.gen(function* () {
+                yield* sql`INSERT INTO consumed_secret_request_refs (secret_ref, consumer_id, consumed_at)
+              VALUES (${input.ref}, ${input.consumerId ?? null}, 0)`;
+                return yield* persist(value);
+              }),
+            );
+            secretsByRef.delete(input.ref);
+            return result;
+          }).pipe(
+            Effect.mapError((error) =>
+              SqlError.isSqlError(error)
+                ? new SecretRequestError({ reason: "consume_failed", cause: error })
+                : error,
+            ),
+          ),
         consume: ({ ref }) => {
           const value = secretsByRef.get(ref);
           secretsByRef.delete(ref);
@@ -100,10 +129,23 @@ const withService = <A, E>(
         Effect.succeed({ relayHookBaseUrl: options.relayHookBaseUrl ?? null }),
       ),
     );
-    return yield* Effect.gen(function* () {
-      const service = yield* ScheduledTaskService.ScheduledTaskService;
-      return yield* body({ service, launches, secretsByRef });
-    }).pipe(Effect.provide(ScheduledTaskService.layer.pipe(Layer.provide(dependencies))));
+    let serviceScope = yield* Scope.make();
+    yield* Effect.addFinalizer((exit) => Scope.close(serviceScope, exit));
+    const build = () =>
+      Layer.buildWithScope(
+        Layer.fresh(ScheduledTaskService.layer.pipe(Layer.provide(dependencies))),
+        serviceScope,
+      ).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.map((context) => Context.get(context, ScheduledTaskService.ScheduledTaskService)),
+      );
+    const service = yield* build();
+    const restart = Effect.gen(function* () {
+      yield* Scope.close(serviceScope, Exit.void);
+      serviceScope = yield* Scope.make();
+      return yield* build();
+    });
+    return yield* body({ service, launches, secretsByRef, sql, restart });
   }).pipe(Effect.provide(SqlitePersistenceMemory));
 
 it.effect("dispatches exactly the rendered prompt and logs the delivery", () =>
@@ -891,6 +933,78 @@ it.effect("counts each handled request by what happened to it", () =>
       assert.equal((yield* deliveriesCounted("not_found", "direct")) - before.notFound, 1);
       assert.equal((yield* deliveriesCounted("accepted", "relay")) - before.relayAccepted, 1);
       assert.equal((yield* deliveriesCounted("duplicate", "relay")) - before.duplicate, 1);
+    }),
+  ),
+);
+
+it.effect("acknowledged dispatch survives service shutdown and replays the same command", () =>
+  Effect.gen(function* () {
+    const gate = yield* Deferred.make<void>();
+    return yield* withService(
+      ({ service, launches, sql, restart }) =>
+        Effect.gen(function* () {
+          const { task } = yield* service.upsert(yield* webhookTaskInput());
+          const accepted = yield* service.triggerWebhook(
+            requestFor(task, { relayDeliveryId: "restart-delivery" }),
+          );
+          assert.equal(accepted._tag, "accepted");
+          const first = yield* Queue.take(launches);
+          const pending = yield* sql`SELECT * FROM scheduled_task_webhook_dispatches`;
+          assert.equal(pending.length, 1);
+          const recovered = yield* restart;
+          const replay = yield* Queue.take(launches);
+          assert.equal(replay.commandId, first.commandId);
+          assert.equal(replay.initialMessage?.text, first.initialMessage?.text);
+          const duplicate = yield* recovered.triggerWebhook(
+            requestFor(task, { relayDeliveryId: "restart-delivery" }),
+          );
+          assert.equal(
+            duplicate._tag === "accepted" ? duplicate.outcome : duplicate._tag,
+            "duplicate",
+          );
+          yield* Deferred.succeed(gate, undefined);
+        }),
+      { gate },
+    );
+  }),
+);
+it.effect("a failed pending-dispatch write rolls back the relay claim and can retry", () =>
+  withService(({ service, launches, sql }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(yield* webhookTaskInput());
+      yield* sql`CREATE TRIGGER fail_pending BEFORE INSERT ON scheduled_task_webhook_dispatches
+      BEGIN SELECT RAISE(ABORT, 'injected pending failure'); END`;
+      const request = requestFor(task, { relayDeliveryId: "retry-after-write" });
+      yield* service.triggerWebhook(request).pipe(Effect.flip);
+      assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_relay_deliveries`).length, 0);
+      assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_dispatches`).length, 0);
+      yield* sql`DROP TRIGGER fail_pending`;
+      assert.equal((yield* service.triggerWebhook(request))._tag, "accepted");
+      yield* Queue.take(launches);
+    }),
+  ),
+);
+it.effect("a failed signed-task save keeps its secret ref for the retry", () =>
+  withService(({ service, secretsByRef, sql }) =>
+    Effect.gen(function* () {
+      const ref = "secret-ref:" + "a".repeat(32);
+      secretsByRef.set(ref, "private-signing-value");
+      const input = yield* webhookTaskInput({
+        commandId: "save-retry",
+        schedule: {
+          type: "webhook",
+          signature: { header: "X-Signature", encoding: "hex", prefix: "", secretRef: ref },
+        },
+      });
+      yield* sql`CREATE TRIGGER fail_task_save BEFORE INSERT ON scheduled_tasks
+      BEGIN SELECT RAISE(ABORT, 'injected task-save failure'); END`;
+      yield* service.upsert(input).pipe(Effect.flip);
+      assert.equal(secretsByRef.get(ref), "private-signing-value");
+      assert.equal((yield* sql`SELECT * FROM consumed_secret_request_refs`).length, 0);
+      yield* sql`DROP TRIGGER fail_task_save`;
+      yield* service.upsert(input);
+      assert.isFalse(secretsByRef.has(ref));
+      yield* service.upsert(input);
     }),
   ),
 );

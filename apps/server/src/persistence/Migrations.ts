@@ -13,6 +13,8 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 import { reconcileV2PreviewMigration } from "./reconcileV2PreviewMigration.ts";
 
+import MigrationWebhookDispatchOutbox from "./Migrations/059_WebhookDispatchOutbox.ts";
+
 // Import all migrations statically
 import Migration0001 from "./Migrations/001_OrchestrationEvents.ts";
 import Migration0002 from "./Migrations/002_OrchestrationCommandReceipts.ts";
@@ -144,6 +146,7 @@ export const migrationEntries = [
   [56, "RemoveRedundantProjectionIndexes", Migration0056],
   [57, "ScheduledTaskWebhooks", Migration0057],
   [58, "WebhookRelayDeliveries", Migration0058],
+  [59, "WebhookDispatchOutbox", MigrationWebhookDispatchOutbox],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

@@ -76,6 +76,7 @@ import { makeProviderRegistryLayer } from "../provider/testUtils/providerRegistr
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -695,6 +696,7 @@ describe("orchestrator MCP toolkit", () => {
             ),
             Layer.provideMerge(
               SecretRequests.layer.pipe(
+                Layer.provide(SqlitePersistenceMemory),
                 Layer.provide(memorySecretStoreLayer),
                 Layer.provide(orchestrationLayer),
               ),
@@ -3721,6 +3723,7 @@ describe("orchestrator MCP toolkit", () => {
           Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
           Layer.provideMerge(
             SecretRequests.layer.pipe(
+              Layer.provide(SqlitePersistenceMemory),
               Layer.provide(memorySecretStoreLayer),
               Layer.provide(orchestrationLayer),
             ),

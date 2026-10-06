@@ -2,6 +2,7 @@ import { useNavigation } from "@react-navigation/native";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   htmlRenderFileName,
+  initializeHtmlRenderTheme,
   htmlRenderFrameHeight,
   htmlRenderThemeMessage,
   loadRestrictedHtmlRender,
@@ -104,11 +105,14 @@ export function HtmlRenderWebView(props: {
   };
   // Streaming parent renders may replace callbacks without changing the page URL.
   const reportFetchError = useEffectEvent(handleLoadError);
+  const completeFetch = useEffectEvent((uri: string, html: string) =>
+    setPage({ uri, html: initializeHtmlRenderTheme(html, theme) }),
+  );
   useEffect(() => {
     const request = new AbortController();
     void loadRestrictedHtmlRender(uri, request.signal).then(
       (html) => {
-        if (!request.signal.aborted) setPage({ uri, html });
+        if (!request.signal.aborted) completeFetch(uri, html);
       },
       () => {
         if (!request.signal.aborted) reportFetchError();

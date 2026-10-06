@@ -1,11 +1,11 @@
 import {
-  htmlRenderThemeFragment,
+  initializeHtmlRenderTheme,
   loadRestrictedHtmlRender,
   htmlRenderThemeMessage,
   htmlRenderResult,
   readHtmlRenderLinkRequest,
 } from "@t3tools/shared/htmlRender";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 
 import { useHtmlRenderTheme } from "~/hooks/useHtmlRenderTheme";
 import { cn } from "~/lib/utils";
@@ -73,15 +73,18 @@ export function HtmlRenderDocument(props: {
 }) {
   const theme = useHtmlRenderTheme();
   const frameRef = useRef<HTMLIFrameElement>(null);
-  const [src] = useState(() => `${props.src.split("#", 1)[0]}${htmlRenderThemeFragment(theme)}`);
+  const [src] = useState(() => props.src.split("#", 1)[0]!);
   const [loaded, setLoaded] = useState(false);
   const [pageHtml, setPageHtml] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const completeFetch = useEffectEvent((html: string) =>
+    setPageHtml(initializeHtmlRenderTheme(html, theme)),
+  );
   useEffect(() => {
     const request = new AbortController();
     void loadRestrictedHtmlRender(src, request.signal).then(
       (html) => {
-        if (!request.signal.aborted) setPageHtml(html);
+        if (!request.signal.aborted) completeFetch(html);
       },
       () => {
         if (!request.signal.aborted) setFailed(true);

@@ -1059,10 +1059,15 @@ describe("OrchestratorMcpService provider resolution", () => {
 
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const delegate = (clientRequestId: string) =>
+        const delegate = (clientRequestId: string, byDriver = false) =>
           service.delegateTask(scope, {
             task: "Review the diff.",
-            target: { providerInstanceId: claudeInstanceId, model: "claude-opus-5-5" },
+            target: {
+              ...(byDriver
+                ? { driverKind: claudeDriver }
+                : { providerInstanceId: claudeInstanceId }),
+              model: "claude-opus-5-5",
+            },
             mode: "async",
             clientRequestId,
           });
@@ -1072,11 +1077,20 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.equal(yield* Ref.get(probes), 1);
         assert.equal(yield* Ref.get(dispatched), 0);
 
+        const driverError = yield* delegate("delegate-driver-recheck-1", true).pipe(Effect.flip);
+        assert.equal(driverError.code, "provider_unavailable");
+        assert.equal(yield* Ref.get(probes), 2);
+        assert.equal(yield* Ref.get(dispatched), 0);
+
         cliInstalled = true;
         const result = yield* delegate("delegate-recheck-2");
         assert.equal(result.providerInstanceId, claudeInstanceId);
-        assert.equal(yield* Ref.get(probes), 2);
+        assert.equal(yield* Ref.get(probes), 3);
         assert.equal(yield* Ref.get(dispatched), 1);
+        const driverResult = yield* delegate("delegate-driver-recheck-2", true);
+        assert.equal(driverResult.providerInstanceId, claudeInstanceId);
+        assert.equal(yield* Ref.get(probes), 4);
+        assert.equal(yield* Ref.get(dispatched), 2);
       }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
     }),
   );

@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as TestClock from "effect/testing/TestClock";
@@ -97,22 +98,24 @@ const withService = <A, E>(
       ),
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadRecords: () =>
-          Effect.succeed({
-            thread: { projectId },
-            runs: [{ id: "run-1", status: options.runStatus ?? "running" }],
-            turnItems: [
-              {
-                id: turnItemId,
-                threadId: requestThreadId,
-                runId: "run-1",
-                nodeId: "node-root",
-                type: "secret_request",
-                label: "GitHub token",
-                reason: "Used as GH_TOKEN.",
-                secretStatus,
-              },
-            ],
-          } as never),
+          Effect.yieldNow.pipe(
+            Effect.as({
+              thread: { projectId },
+              runs: [{ id: "run-1", status: options.runStatus ?? "running" }],
+              turnItems: [
+                {
+                  id: turnItemId,
+                  threadId: requestThreadId,
+                  runId: "run-1",
+                  nodeId: "node-root",
+                  type: "secret_request",
+                  label: "GitHub token",
+                  reason: "Used as GH_TOKEN.",
+                  secretStatus,
+                },
+              ],
+            } as never),
+          ),
         dispatch: (command) => {
           if (command.type === "secret_request.record" && failedRecords > 0) {
             failedRecords -= 1;
@@ -518,6 +521,45 @@ it.effect("saved secret consumption preserves intentional whitespace bytes", () 
       yield* service.answer({ threadId, turnItemId, answer: { type: "save", secret } });
       const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
       assert.equal(yield* service.consume({ ref, projectId }), secret);
+    }),
+  ),
+);
+
+it.effect("a concurrent losing decline cannot delete a winning save", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const [saved, declined] = yield* Effect.all(
+        [
+          service
+            .answer({ threadId, turnItemId, answer: { type: "save", secret: "winning-secret" } })
+            .pipe(Effect.exit),
+          service.answer({ threadId, turnItemId, answer: { type: "decline" } }).pipe(Effect.exit),
+        ],
+        { concurrency: 2 },
+      );
+      assert.isTrue(Exit.isSuccess(saved));
+      assert.isTrue(Exit.isFailure(declined));
+      const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
+      assert.equal(yield* service.consume({ ref, projectId }), "winning-secret");
+    }),
+  ),
+);
+
+it.effect("a concurrent losing save cannot recreate a declined secret", () =>
+  withService(({ service }) =>
+    Effect.gen(function* () {
+      const [declined, saved] = yield* Effect.all(
+        [
+          service.answer({ threadId, turnItemId, answer: { type: "decline" } }).pipe(Effect.exit),
+          service
+            .answer({ threadId, turnItemId, answer: { type: "save", secret: "losing-secret" } })
+            .pipe(Effect.exit),
+        ],
+        { concurrency: 2 },
+      );
+      assert.isTrue(Exit.isSuccess(declined));
+      assert.isTrue(Exit.isFailure(saved));
+      assert.isTrue(Option.isNone(yield* service.savedRef({ threadId, turnItemId })));
     }),
   ),
 );

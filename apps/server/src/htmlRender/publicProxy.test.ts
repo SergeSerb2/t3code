@@ -9,6 +9,7 @@ import { publicProxy } from "./publicProxy.ts";
 
 // A public IPv4 address this machine holds, which no private range covers.
 const OWN_PUBLIC_IPV4 = "198.51.100.7";
+const OWN_GLOBAL_IPV6 = "2001:db8:42::7";
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeOS>();
   return {
@@ -23,6 +24,15 @@ vi.mock("node:os", async (importOriginal) => {
           mac: "00:00:00:00:00:00",
           internal: false,
           cidr: `${OWN_PUBLIC_IPV4}/24`,
+        },
+        {
+          address: OWN_GLOBAL_IPV6,
+          netmask: "ffff:ffff:ffff:ffff::",
+          family: "IPv6",
+          mac: "00:00:00:00:00:00",
+          internal: false,
+          cidr: null,
+          scopeid: 0,
         },
       ],
     }),
@@ -184,3 +194,19 @@ describe("publicProxy", () => {
     }),
   );
 });
+
+it.effect("refuses neighboring public IPv4 and global IPv6 subnet addresses", () =>
+  Effect.gen(function* () {
+    const port = yield* publicProxy;
+    for (const target of [
+      ipv4Target("198.51.100.99", 80),
+      ipv6Target("::ffff:c633:6463", 80),
+      ipv6Target("64:ff9b::c633:6463", 80),
+      ipv6Target("2001:db8:42::99", 80),
+    ]) {
+      const { code, socket } = yield* connectThrough(port, target);
+      socket.destroy();
+      expect(code).toBe(2);
+    }
+  }).pipe(Effect.scoped),
+);

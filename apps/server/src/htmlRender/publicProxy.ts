@@ -68,11 +68,34 @@ const embeddedIPv4 = (address: string) => {
   return [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
 };
 
-/** The addresses this machine's interfaces hold right now. */
+/** A contiguous interface netmask's prefix, including IPv6 masks. */
+const netmaskPrefix = (mask: string, family: "IPv4" | "IPv6") => {
+  if (NodeNet.isIP(mask) !== (family === "IPv6" ? 6 : 4)) return undefined;
+  const width = family === "IPv6" ? 16 : 8;
+  const groups = family === "IPv6" ? ipv6Groups(mask) : mask.split(".").map(Number);
+  const bits = groups.map((group) => group.toString(2).padStart(width, "0")).join("");
+  if (!/^1*0*$/.test(bits)) return undefined;
+  const firstZero = bits.indexOf("0");
+  return firstZero === -1 ? bits.length : firstZero;
+};
+
+/** The full local subnets this machine's interfaces hold right now. */
 const ownAddresses = () => {
   const own = new NodeNet.BlockList();
   for (const entry of Object.values(NodeOS.networkInterfaces()).flat()) {
-    if (entry) own.addAddress(entry.address, entry.family === "IPv6" ? "ipv6" : "ipv4");
+    if (!entry) continue;
+    const type = entry.family === "IPv6" ? "ipv6" : "ipv4";
+    own.addAddress(entry.address, type);
+    const cidrPrefix = entry.cidr == null ? undefined : Number(entry.cidr.split("/")[1]);
+    const prefix = cidrPrefix ?? netmaskPrefix(entry.netmask, entry.family);
+    if (
+      prefix !== undefined &&
+      Number.isInteger(prefix) &&
+      prefix >= 0 &&
+      prefix <= (type === "ipv6" ? 128 : 32)
+    ) {
+      own.addSubnet(entry.address, prefix, type);
+    }
   }
   return own;
 };

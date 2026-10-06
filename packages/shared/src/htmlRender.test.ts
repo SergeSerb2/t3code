@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   loadRestrictedHtmlRender,
+  initializeHtmlRenderTheme,
   htmlRenderFrameHeight,
   htmlRenderReferencesEqual,
   htmlRenderTheme,
@@ -264,4 +265,44 @@ it("does not hand an error response or oversized document to a client browser", 
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+describe("initial theme for in-memory HTML documents", () => {
+  const theme = { appearance: "dark" as const, variables: { "--background": "rgb(1,2,3)" } };
+  it("replaces the OS palette before document scripts and preserves page styles", () => {
+    const page = injectHtmlRenderBootstrap(
+      "<head><style>:root{--accent:purple}</style></head><body>Page</body>",
+    );
+    const themed = initializeHtmlRenderTheme(page, theme);
+    expect(themed).toContain(":root{color-scheme:dark;--background:rgb(1,2,3);");
+    expect(themed).toContain("<style>:root{--accent:purple}</style>");
+    expect(themed).not.toContain("@media (prefers-color-scheme: light)");
+    expect(themed.indexOf("--background:rgb(1,2,3)")).toBeLessThan(themed.indexOf("<script>"));
+    expect(themed.indexOf("Content-Security-Policy")).toBeLessThan(themed.indexOf("<style"));
+  });
+  it("ignores fake theme markers in scripts, comments and inert templates", () => {
+    const inert = '<template><style id="t3-theme">inert</style></template>';
+    const fake = "<script>const fake = '<style id=\"t3-theme\">fake</style>';</script>";
+    const page = injectHtmlRenderBootstrap("<head>" + inert + fake + "</head>");
+    const themed = initializeHtmlRenderTheme(page, theme);
+    expect(themed).toContain(inert);
+    expect(themed).toContain(fake);
+    expect(themed).toContain("--background:rgb(1,2,3)");
+  });
+  it("adds a safe themed bootstrap to older documents without one", () => {
+    const themed = initializeHtmlRenderTheme("<body>Older page</body>", theme);
+    expect(themed).toContain('id="t3-theme"');
+    expect(themed).toContain("--background:rgb(1,2,3)");
+    expect(themed).toContain("Content-Security-Policy");
+  });
+});
+
+it("initial theme values cannot break out of their style element", () => {
+  const themed = initializeHtmlRenderTheme("<body>Page</body>", {
+    appearance: "light",
+    variables: { "--background": "red;</style><script>bad()</script>", "invalid-key": "ignored" },
+  });
+  expect(themed).not.toContain("<script>bad()");
+  expect(themed).not.toContain("invalid-key:");
+  expect(themed).toContain("color-scheme:light");
 });

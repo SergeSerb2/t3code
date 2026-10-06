@@ -301,9 +301,10 @@ const BASE_CSS =
 
 function rootRule(theme: HtmlRenderTheme): string {
   const declarations = Object.entries(theme.variables)
-    .map(([name, value]) => `${name}:${value};`)
+    .filter(([name]) => /^--[a-z0-9-]+$/.test(name))
+    .map(([name, value]) => `${name}:${String(value).replace(/[;{}<>]/g, "")};`)
     .join("");
-  return `:root{color-scheme:${theme.appearance};${declarations}}`;
+  return `:root{color-scheme:${theme.appearance === "light" ? "light" : "dark"};${declarations}}`;
 }
 
 // Runs synchronously in <head>, before the page's own styles and body, so the
@@ -315,12 +316,15 @@ function rootRule(theme: HtmlRenderTheme): string {
 // opens it as a new window, which the client sends to the browser.
 const BOOTSTRAP_SCRIPT = `(function(){var s=document.getElementById("t3-theme"),n=0;if(!s)return;var b=${JSON.stringify(BASE_CSS)};function a(t){if(!t||typeof t!=="object"||!t.variables||typeof t.variables!=="object")return;var c=":root{color-scheme:"+(t.appearance==="light"?"light":"dark")+";";for(var k in t.variables){if(/^--[a-z0-9-]+$/.test(k))c+=k+":"+String(t.variables[k]).replace(/[;{}<>]/g,"")+";";}s.textContent=c+"}"+b;}try{var m=/[#&]${THEME_FRAGMENT_KEY}=([^&]*)/.exec(location.hash);if(m){a(JSON.parse(decodeURIComponent(m[1])));history.replaceState(history.state,"",location.pathname+location.search);}}catch(e){}window.addEventListener("message",function(e){var d=e.data,p=d&&d.params;if(d&&d.jsonrpc==="2.0"&&d.method===${JSON.stringify(HOST_CONTEXT_CHANGED_METHOD)}&&p&&p.styles)a({appearance:p.theme,variables:p.styles.variables});});document.addEventListener("click",function(e){var l=e.isTrusted?e.composedPath().find(function(t){return t&&t.matches&&t.matches("a[href]");}):null,u;if(!l)return;try{u=new URL(l.getAttribute("href"),document.baseURI);}catch(x){return;}if(!/^https?:$/.test(u.protocol)||u.href.split("#")[0]===location.href.split("#")[0])return;if(window.parent!==window){e.preventDefault();window.parent.postMessage({jsonrpc:"2.0",id:"t3-link-"+(++n),method:${JSON.stringify(OPEN_LINK_METHOD)},params:{url:u.href}},"*");}else{l.setAttribute("target","_blank");l.setAttribute("rel","noopener");}},true);})();`;
 
-function bootstrapMarkup(markup: string): string {
+function bootstrapMarkup(markup: string, initialTheme?: HtmlRenderTheme): string {
   const dark = htmlRenderTheme(T3_CODE_DARK_THEME_COLORS, "dark");
   const light = htmlRenderTheme(T3_CODE_LIGHT_THEME_COLORS, "light");
   // Without a client-provided theme (a direct download, the headless preview
   // without a fragment) the page follows the OS appearance.
-  const defaultCss = `${rootRule(dark)}@media (prefers-color-scheme: light){${rootRule(light)}}${BASE_CSS}`;
+  const defaultCss =
+    initialTheme === undefined
+      ? `${rootRule(dark)}@media (prefers-color-scheme: light){${rootRule(light)}}${BASE_CSS}`
+      : `${rootRule(initialTheme)}${BASE_CSS}`;
   return [
     /<meta\s[^>]*charset/i.test(markup.slice(0, 4096)) ? "" : '<meta charset="utf-8">',
     /<meta\s[^>]*name\s*=\s*["']?viewport/i.test(markup)
@@ -333,10 +337,18 @@ function bootstrapMarkup(markup: string): string {
 
 // Comments, raw text, and template contents are blanked to the same length,
 // so offsets still line up and inert tags cannot receive the bootstrap.
-const blankNonMarkup = (html: string) => {
+const blankNonMarkup = (html: string, retainStyleTags = false) => {
   const scan = html.replace(
     /<!--[\s\S]*?(?:-->|$)|<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)|<plaintext\b[\s\S]*$/gi,
-    (match) => " ".repeat(match.length),
+    (match: string, tag: string | undefined) => {
+      if (!retainStyleTags || tag?.toLowerCase() !== "style") return " ".repeat(match.length);
+      const openEnd = match.indexOf(">") + 1;
+      if (openEnd === 0) return " ".repeat(match.length);
+      const closeAt = /<\/style\s*>$/i.exec(match)?.index ?? match.length;
+      return (
+        match.slice(0, openEnd) + " ".repeat(Math.max(0, closeAt - openEnd)) + match.slice(closeAt)
+      );
+    },
   );
   const parts: string[] = [];
   let depth = 0;
@@ -366,9 +378,9 @@ const blankNonMarkup = (html: string) => {
 export const HTML_RENDER_RESOURCE_POLICY =
   "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
-function injectHtmlRenderThemeBootstrap(html: string): string {
+function injectHtmlRenderThemeBootstrap(html: string, initialTheme?: HtmlRenderTheme): string {
   const scan = blankNonMarkup(html);
-  const markup = bootstrapMarkup(scan);
+  const markup = bootstrapMarkup(scan, initialTheme);
   const headOpen = /<head(?:\s[^>]*)?>/i.exec(scan);
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
@@ -388,8 +400,8 @@ function injectHtmlRenderThemeBootstrap(html: string): string {
 }
 
 /** Establish resource restrictions before any untrusted markup, even a script preceding its head. */
-export function injectHtmlRenderBootstrap(html: string): string {
-  return restrictHtmlRenderResources(injectHtmlRenderThemeBootstrap(html));
+export function injectHtmlRenderBootstrap(html: string, initialTheme?: HtmlRenderTheme): string {
+  return restrictHtmlRenderResources(injectHtmlRenderThemeBootstrap(html, initialTheme));
 }
 
 export function restrictHtmlRenderResources(document: string): string {
@@ -423,4 +435,22 @@ export function loadRestrictedHtmlRender(url: string, signal: AbortSignal): Prom
     ),
     { signal },
   );
+}
+
+/** Theme the actual document before mounting srcDoc/WebView HTML, which have no theme fragment. */
+export function initializeHtmlRenderTheme(html: string, theme: HtmlRenderTheme): string {
+  const scan = blankNonMarkup(html, true);
+  const parts: string[] = [];
+  let at = 0;
+  for (const match of scan.matchAll(
+    /<style\b(?=[^>]*\sid\s*=\s*["']t3-theme["'])[^>]*>[\s\S]*?<\/style\s*>/gi,
+  )) {
+    const start = match.index + match[0].indexOf(">") + 1;
+    const end = match.index + match[0].lastIndexOf("</");
+    parts.push(html.slice(at, start), rootRule(theme) + BASE_CSS);
+    at = end;
+  }
+  if (parts.length === 0) return injectHtmlRenderBootstrap(html, theme);
+  parts.push(html.slice(at));
+  return parts.join("");
 }

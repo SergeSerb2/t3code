@@ -2,11 +2,24 @@
 
 import { act, type ComponentType, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { EnvironmentId, ThreadId, type ThreadPullRequestLink } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 // The mobile workspace uses a newer React copy; keep this unit renderer on one React instance.
 vi.mock("../../../mobile/node_modules/react/index.js", async () => await import("react"));
 const load = vi.hoisted(() => vi.fn());
+const watchPullRequest = vi.hoisted(() => vi.fn());
+vi.mock("../../../mobile/src/state/threads", () => ({
+  threadEnvironment: { watchPullRequest: Symbol("watchPullRequest") },
+}));
+vi.mock("../../../mobile/src/state/use-atom-command", () => ({
+  useAtomCommand: () => watchPullRequest,
+}));
+vi.mock("../../../mobile/src/features/threads/git/gitSheetComponents", () => ({
+  SheetListRow: ({ title, onPress }: { title: string; onPress: () => void }) => (
+    <button onClick={onPress}>{title}</button>
+  ),
+}));
 vi.mock("@t3tools/shared/htmlRender", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   loadRestrictedHtmlRender: load,
@@ -46,7 +59,7 @@ vi.mock("../../../mobile/src/components/EmptyState", () => ({
   ),
 }));
 vi.mock("../../../mobile/src/lib/htmlRenderTheme", () => ({
-  mobileHtmlRenderTheme: () => ({ variables: { "--background": "white" } }),
+  mobileHtmlRenderTheme: () => ({ appearance: "light", variables: { "--background": "white" } }),
 }));
 vi.mock("../../../mobile/src/lib/openExternalUrl", () => ({ tryOpenExternalUrl: vi.fn() }));
 vi.mock("../../../mobile/src/state/assets", () => ({
@@ -129,7 +142,10 @@ describe("mobile HTML request lifecycle", () => {
     await act(async () => resolve("old page"));
     expect(signal.aborted).toBe(true);
     expect(load).toHaveBeenCalledTimes(2);
-    expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("new page");
+    expect(container.querySelector('[data-testid="page"]')?.textContent).toContain("new page");
+    expect(container.querySelector('[data-testid="page"]')?.textContent).toContain(
+      "--background:white",
+    );
   });
   it("replaces the full-screen spinner with an error and reauthorizes on retry", async () => {
     load.mockRejectedValueOnce(new Error("expired asset URL"));
@@ -155,6 +171,47 @@ describe("mobile HTML request lifecycle", () => {
     await act(async () => container.querySelector("button")!.click());
     expect(retry).toHaveBeenCalledOnce();
     expect(load).toHaveBeenLastCalledWith("https://asset/fresh", expect.any(AbortSignal));
-    expect(container.querySelector('[data-testid="page"]')?.textContent).toBe("recovered page");
+    expect(container.querySelector('[data-testid="page"]')?.textContent).toContain(
+      "recovered page",
+    );
   });
+});
+
+const watchModule = "../../../mobile/src/features/threads/git/StopWatchingPullRequest.tsx";
+const StopWatchingPullRequest = (await import(watchModule))
+  .StopWatchingPullRequest as ComponentType<{
+  threadRef: { environmentId: EnvironmentId; threadId: ThreadId };
+  link: ThreadPullRequestLink;
+}>;
+it("mobile stops watching the exact linked PR and removes the action once unwatched", async () => {
+  const threadRef = {
+    environmentId: EnvironmentId.make("environment-1"),
+    threadId: ThreadId.make("thread-1"),
+  };
+  const link = {
+    host: "github.com",
+    repository: "owner/repo",
+    number: 42,
+    watch: { watching: true },
+  } as unknown as ThreadPullRequestLink;
+  watchPullRequest.mockResolvedValue({ _tag: "Success" });
+  await act(async () => root.render(<StopWatchingPullRequest threadRef={threadRef} link={link} />));
+  expect(container.textContent).toContain("Stop watching #42");
+  await act(async () => container.querySelector("button")!.click());
+  expect(watchPullRequest).toHaveBeenCalledWith({
+    environmentId: threadRef.environmentId,
+    input: {
+      threadId: threadRef.threadId,
+      host: "github.com",
+      repository: "owner/repo",
+      number: 42,
+      watching: false,
+    },
+  });
+  await act(async () =>
+    root.render(
+      <StopWatchingPullRequest threadRef={threadRef} link={{ ...link, watch: undefined }} />,
+    ),
+  );
+  expect(container.querySelector("button")).toBeNull();
 });

@@ -1028,7 +1028,8 @@ const make = Effect.gen(function* () {
   /**
    * Provider snapshots only re-probe while a client is in the foreground, so an
    * unattended agent can see a provider as unavailable after it was fixed.
-   * Re-probe the requested instance once before refusing it.
+   * Re-probe the requested instance, or registered candidates for a driver-only
+   * target, before refusing its stale snapshot.
    */
   const resolveTargetRechecking = (input: Parameters<typeof resolveTarget>[0]) => {
     const instanceId =
@@ -1037,7 +1038,27 @@ const make = Effect.gen(function* () {
         ? input.parent.thread.modelSelection.instanceId
         : undefined);
     const resolved = resolveTarget(input);
-    if (instanceId === undefined) return resolved;
+    if (instanceId === undefined) {
+      return resolved.pipe(
+        Effect.catchIf(
+          (error) => error.code === "provider_unavailable",
+          () =>
+            Effect.gen(function* () {
+              const registered = yield* loadOrchestrationCapableInstanceIds();
+              const candidates = input.providers.filter(
+                (provider) =>
+                  provider.driver === input.target?.driverKind &&
+                  registered.has(provider.instanceId),
+              );
+              let providers = input.providers;
+              for (const candidate of candidates) {
+                providers = yield* providerRegistry.refreshInstance(candidate.instanceId);
+              }
+              return yield* resolveTarget({ ...input, providers });
+            }),
+        ),
+      );
+    }
     return resolved.pipe(
       Effect.catchIf(
         (error) => error.code === "provider_unavailable",

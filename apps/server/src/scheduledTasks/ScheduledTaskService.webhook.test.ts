@@ -18,6 +18,7 @@ import * as Context from "effect/Context";
 import * as Scope from "effect/Scope";
 import * as Exit from "effect/Exit";
 import * as TestClock from "effect/testing/TestClock";
+import * as Stream from "effect/Stream";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -77,7 +78,11 @@ const withService = <A, E>(
     readonly sql: SqlClient.SqlClient;
     readonly restart: Effect.Effect<ScheduledTaskService.ScheduledTaskService["Service"]>;
   }) => Effect.Effect<A, E, never>,
-  options: { readonly gate?: Deferred.Deferred<void>; readonly relayHookBaseUrl?: string } = {},
+  options: {
+    readonly gate?: Deferred.Deferred<void>;
+    readonly relayHookBaseUrl?: string;
+    readonly launchFails?: boolean;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -90,7 +95,11 @@ const withService = <A, E>(
         launch: (input) =>
           Queue.offer(launches, input).pipe(
             Effect.andThen(options.gate ? Deferred.await(options.gate) : Effect.void),
-            Effect.as({ threadId: "thread-1", resumed: false } as never),
+            Effect.andThen(
+              options.launchFails
+                ? Effect.fail(new Error("Project no longer exists.") as never)
+                : Effect.succeed({ threadId: "thread-1", resumed: false } as never),
+            ),
           ),
       }),
       Layer.mock(ThreadManagementService.ThreadManagementService)({}),
@@ -1005,6 +1014,89 @@ it.effect("a failed signed-task save keeps its secret ref for the retry", () =>
       yield* service.upsert(input);
       assert.isFalse(secretsByRef.has(ref));
       yield* service.upsert(input);
+      yield* service.upsert(
+        yield* webhookTaskInput({
+          title: "Newer edit",
+          prompt: "Keep the newer prompt",
+          schedule: {
+            type: "webhook",
+            signature: {
+              header: "X-Signature",
+              encoding: "hex",
+              prefix: "",
+              secret: "new-signing-value",
+            },
+          },
+        }),
+      );
+      const replay = yield* service.upsert(input);
+      assert.equal(replay.task.title, "Newer edit");
+      assert.equal(replay.task.prompt, "Keep the newer prompt");
+      assert.equal(
+        (yield* sql<{
+          webhook_secret: string;
+        }>`SELECT webhook_secret FROM scheduled_tasks WHERE task_id = ${replay.task.id}`)[0]
+          ?.webhook_secret,
+        "new-signing-value",
+      );
+      yield* service.delete({ id: replay.task.id });
+      yield* service.upsert(input).pipe(Effect.flip);
+      assert.equal((yield* service.list()).tasks.length, 0);
+    }),
+  ),
+);
+
+it.effect("a permanently failing dispatch leaves the queue after five attempts", () =>
+  withService(
+    ({ service, launches, sql }) =>
+      Effect.gen(function* () {
+        const { task } = yield* service.upsert(yield* webhookTaskInput());
+        yield* service.triggerWebhook(requestFor(task, { relayDeliveryId: "permanent-failure" }));
+        yield* Queue.take(launches);
+        // Advance the recurring scheduler, not wall-clock time or an assertion poll.
+        yield* TestClock.adjust("30 seconds");
+        assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_dispatches`).length, 0);
+        const { deliveries } = yield* service.listWebhookDeliveries({ id: task.id });
+        assert.include(deliveries[0]!.error!, "stopped after 5 failed attempts");
+        assert.equal((yield* service.list()).tasks[0]!.runCount, 1);
+        assert.equal(yield* Queue.size(launches), 4);
+        const next = yield* service.triggerWebhook(
+          requestFor(task, { relayDeliveryId: "later-delivery" }),
+        );
+        assert.equal(next._tag, "accepted");
+      }),
+    { launchFails: true },
+  ),
+);
+it.effect("completion and pending removal roll back together and recovery counts once", () =>
+  withService(({ service, launches, sql, restart }) =>
+    Effect.gen(function* () {
+      const { task } = yield* service.upsert(yield* webhookTaskInput());
+      yield* sql`CREATE TRIGGER fail_dispatch_cleanup BEFORE DELETE ON scheduled_task_webhook_dispatches
+      BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END`;
+      const failed = yield* service.subscribeList().pipe(
+        Stream.filter((list) => list.tasks.some((task) => task.lastRunStatus === "failed")),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* service.triggerWebhook(requestFor(task, { relayDeliveryId: "completion-retry" }));
+      const first = yield* Queue.take(launches);
+      yield* Fiber.join(failed);
+      assert.equal((yield* service.list()).tasks[0]!.runCount, 0);
+      assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_dispatches`).length, 1);
+      yield* sql`DROP TRIGGER fail_dispatch_cleanup`;
+      const recovered = yield* restart;
+      const replay = yield* Queue.take(launches);
+      assert.equal(replay.commandId, first.commandId);
+      yield* recovered.subscribeList().pipe(
+        Stream.filter((list) => list.tasks.some((task) => task.lastRunStatus === "succeeded")),
+        Stream.runHead,
+      );
+      assert.equal((yield* sql`SELECT * FROM scheduled_task_webhook_dispatches`).length, 0);
+      assert.equal((yield* recovered.list()).tasks[0]!.runCount, 1);
+      const afterRestart = yield* restart;
+      assert.equal((yield* afterRestart.list()).tasks[0]!.runCount, 1);
+      assert.equal(yield* Queue.size(launches), 0);
     }),
   ),
 );

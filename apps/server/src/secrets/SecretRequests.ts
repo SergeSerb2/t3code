@@ -64,6 +64,8 @@ const StoredSecret = Schema.fromJsonString(
 const encodeStored = Schema.encodeEffect(StoredSecret);
 const decodeStored = Schema.decodeUnknownOption(StoredSecret);
 
+const isSecretRequestError = Schema.is(SecretRequestError);
+
 const fail = (reason: SecretRequestFailureReason, cause?: unknown) =>
   new SecretRequestError({ reason, ...(cause === undefined ? {} : { cause }) });
 
@@ -81,7 +83,7 @@ export class SecretRequests extends Context.Service<
       readonly turnItemId: string;
     }) => Effect.Effect<Option.Option<SecretRef>>;
     /**
-     * Reads and deletes a ref's value. Fails for unknown or used refs, and
+     * Claims a ref once, then cleans up its value. Fails for unknown or used refs, and
      * for refs entered in another project.
      */
     readonly consume: (input: {
@@ -252,19 +254,18 @@ const make = Effect.gen(function* () {
   const consume: SecretRequests["Service"]["consume"] = (input) =>
     Effect.gen(function* () {
       const value = yield* readRef(input);
-      return yield* sql
-        .withTransaction(
-          Effect.gen(function* () {
-            yield* claimRef(input.ref);
-            if (!(yield* removeLogged(storeName(input.ref)))) return yield* fail("consume_failed");
-            return value;
-          }),
-        )
+      // Commit the one-use claim before destructive cleanup. A failed commit
+      // leaves the value available; after commit the claim prevents reuse even
+      // if filesystem cleanup fails.
+      yield* sql
+        .withTransaction(claimRef(input.ref))
         .pipe(
           Effect.mapError((cause) =>
-            Schema.is(SecretRequestError)(cause) ? cause : fail("consume_failed", cause),
+            isSecretRequestError(cause) ? cause : fail("consume_failed", cause),
           ),
         );
+      yield* removeLogged(storeName(input.ref));
+      return value;
     }).pipe(
       consumeLock.withPermits(1),
       Effect.tap(() => Metrics.increment(Metrics.secretRefsConsumedTotal, { result: "used" })),

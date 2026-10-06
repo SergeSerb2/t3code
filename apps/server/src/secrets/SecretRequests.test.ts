@@ -14,6 +14,7 @@ import * as Metric from "effect/Metric";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as PlatformError from "effect/PlatformError";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
@@ -32,6 +33,7 @@ const withService = <A, E>(
     readonly service: SecretRequests.SecretRequests["Service"];
     readonly stored: Map<string, Uint8Array>;
     readonly dispatched: Array<OrchestrationV2ServerCommand>;
+    readonly sql: SqlClient.SqlClient;
   }) => Effect.Effect<A, E>,
   options: {
     readonly threadId?: ThreadId;
@@ -44,6 +46,7 @@ const withService = <A, E>(
   } = {},
 ) =>
   Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
     const stored = new Map<string, Uint8Array>();
     const dispatched: Array<OrchestrationV2ServerCommand> = [];
     let secretStatus = "pending";
@@ -130,7 +133,7 @@ const withService = <A, E>(
     );
     return yield* Effect.gen(function* () {
       const service = yield* SecretRequests.SecretRequests;
-      return yield* body({ service, stored, dispatched });
+      return yield* body({ service, stored, dispatched, sql });
     }).pipe(Effect.provide(SecretRequests.layer.pipe(Layer.provide(dependencies))));
   }).pipe(Effect.provide(SqlitePersistenceMemory));
 
@@ -397,7 +400,7 @@ it.effect("drops values nobody used once they expire, and keeps the rest", () =>
   ),
 );
 
-it.effect("a used value that cannot be deleted is not handed out", () =>
+it.effect("a durable claim permits one handoff even when file cleanup fails", () =>
   withService(
     ({ service }) =>
       Effect.gen(function* () {
@@ -407,8 +410,9 @@ it.effect("a used value that cannot be deleted is not handed out", () =>
           answer: { type: "save", secret: "ghp_secret" },
         });
         const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
-        const failed = yield* service.consume({ ref, projectId }).pipe(Effect.flip);
-        assert.include(failed.message, "Could not use");
+        assert.equal(yield* service.consume({ ref, projectId }), "ghp_secret");
+        const again = yield* service.consume({ ref, projectId }).pipe(Effect.flip);
+        assert.equal(again.reason, "ref_unavailable");
       }),
     { removeFails: true },
   ),
@@ -462,5 +466,29 @@ it.effect("a committed consumer cannot reuse a ref even if file cleanup fails", 
         );
       }),
     { removeFails: true },
+  ),
+);
+
+it.effect("a failed claim commit leaves the secret value available for retry", () =>
+  withService(({ service, stored, sql }) =>
+    Effect.gen(function* () {
+      yield* service.answer({
+        threadId,
+        turnItemId,
+        answer: { type: "save", secret: "ghp_secret" },
+      });
+      const ref = Option.getOrThrow(yield* service.savedRef({ threadId, turnItemId }));
+      // A deferred foreign-key violation fails COMMIT, after the transaction body ran.
+      yield* sql`CREATE TABLE claim_commit_parent (id TEXT PRIMARY KEY)`;
+      yield* sql`CREATE TABLE claim_commit_guard (
+      ref TEXT REFERENCES claim_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      yield* sql`CREATE TRIGGER fail_claim_commit AFTER INSERT ON consumed_secret_request_refs
+      BEGIN INSERT INTO claim_commit_guard(ref) VALUES (NEW.secret_ref); END`;
+      assert.equal((yield* service.consume({ ref, projectId }).pipe(Effect.exit))._tag, "Failure");
+      assert.equal((yield* sql`SELECT * FROM consumed_secret_request_refs`).length, 0);
+      assert.isTrue(stored.has(`secret-request-${ref.slice("secret-ref:".length)}`));
+      yield* sql`DROP TRIGGER fail_claim_commit`;
+      assert.equal(yield* service.consume({ ref, projectId }), "ghp_secret");
+    }),
   ),
 );
